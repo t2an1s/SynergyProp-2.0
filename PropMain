@@ -100,6 +100,9 @@ input int       HedgeEA_Magic = 789123;                // Hedge EA Magic Number
 input bool      InputEnableHedgeCommunication = true; // Enable Hedge Communication (read-only)
 bool EnableHedgeCommunication;  // Will be set in OnInit
 input ENUM_COMMUNICATION_METHOD CommunicationMethod = GLOBAL_VARS; // Hedge Communication Method
+
+// Shared signal file path (for FILE_BASED mode)
+string SignalFilePath;
 input int       CurrentPhase = 1;                      // Current Challenge Phase (1 or 2)
 
 //+------------------------------------------------------------------+
@@ -279,6 +282,8 @@ int OnInit()
 
    // Set this at the very beginning of OnInit
    EnableHedgeCommunication = InputEnableHedgeCommunication;
+   // Prepare shared file path for FILE_BASED communication
+   SignalFilePath = TerminalInfoString(TERMINAL_COMMONDATA_PATH) + "\\Synergy_Signals.txt";
    
    // Set trade parameters
    trade.SetExpertMagicNumber(Magic_Number);
@@ -365,8 +370,7 @@ int OnInit()
       else
       {
          // Test file creation for file-based communication
-         string fileName = "Synergy_Signals.txt";
-         int fileHandle = FileOpen(fileName, FILE_WRITE|FILE_TXT);
+         int fileHandle = FileOpen(SignalFilePath, FILE_WRITE|FILE_TXT);
 
          if(fileHandle != INVALID_HANDLE)
          {
@@ -1948,8 +1952,7 @@ void SendHedgeSignal(string signalType, string direction, double volume, double 
    else
    {
       // Use file-based communication
-      string fileName = "Synergy_Signals.txt";
-      int fileHandle = FileOpen(fileName, FILE_WRITE|FILE_TXT);
+      int fileHandle = FileOpen(SignalFilePath, FILE_WRITE|FILE_TXT);
       
       if(fileHandle != INVALID_HANDLE)
       {
