@@ -28,6 +28,9 @@ input int       Magic_Number          = 789123;            // must match hedgeMa
 input bool      EnableTrading         = true;
 input ENUM_COMMUNICATION_METHOD CommunicationMethod = GLOBAL_VARS;
 
+// Shared signal file path (for FILE_BASED mode)
+string SignalFilePath;
+
 input group "Hedge Settings"
 input int       SourceEA_Magic        = 123456;            // magic of main strategy EA
 
@@ -92,6 +95,8 @@ int OnInit()
 {
    trade.SetExpertMagicNumber(Magic_Number);
    initialBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   // Prepare shared file path for FILE_BASED communication
+   SignalFilePath = TerminalInfoString(TERMINAL_COMMONDATA_PATH) + "\\Synergy_Signals.txt";
 
    if(CommunicationMethod==FILE_BASED)
       SignalFilePath = TerminalInfoString(TERMINAL_COMMONDATA_PATH) + "\\Synergy_Signals.txt";
@@ -185,6 +190,10 @@ void CheckForHedgeSignals()
       if(!FileIsExist(SignalFilePath)) return;
       int h=FileOpen(SignalFilePath,FILE_READ|FILE_TXT);
       if(h==INVALID_HANDLE) return;
+
+      if(!FileIsExist(SignalFilePath)) return;
+      int h=FileOpen(SignalFilePath,FILE_READ|FILE_TXT); if(h==INVALID_HANDLE) return;
+
       string content=FileReadString(h); FileClose(h); FileDelete(SignalFilePath);
       string p[]; if(StringSplit(content,',',p)<6) return;
       ProcessSignal(p[0],p[1],StringToDouble(p[2]),StringToDouble(p[3]),StringToDouble(p[4]));
