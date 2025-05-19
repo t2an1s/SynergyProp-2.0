@@ -350,40 +350,24 @@ int OnInit()
    
    // Enable all triggers
    entryTriggersEnabled = UseSynergyScore || UseMarketBias;
-   
-   // Check if hedge communication is possible
-if(EnableHedgeCommunication)
-   {
-      // Initialize the global variables for the hedge EA to find
-      GlobalVariableSet("PROP_HB_" + IntegerToString(Magic_Number), (double)TimeCurrent());
-      GlobalVariableSet("EASignal_Connected_"+IntegerToString(HedgeEA_Magic), (double)TimeCurrent());
-      Print("Main EA registered heartbeat with Magic: ", Magic_Number);
-      Print("Main EA looking for hedge with Magic: ", HedgeEA_Magic);
-   }
-   
-   EventSetTimer(HEARTBEAT_SEC);
-   SendHeartbeat(true);
-   linkWasOK = IsLinkAlive(true);
-   
-   // Add diagnostic output of all global variables 
-   Print("--- GLOBAL VARIABLES AT INIT ---");
-   for(int i=0; i<GlobalVariablesTotal(); i++) {
-      string name = GlobalVariableName(i);
-      double value = GlobalVariableGet(name);
-      Print(name, " = ", value);
-   }
-   Print("-------------------------------");
-   
-   return(INIT_SUCCEEDED);
-}
 
-      
+   // Set up hedge communication if enabled
+   if(EnableHedgeCommunication)
+   {
+      if(CommunicationMethod == GLOBAL_VARS)
+      {
+         // Initialize the global variables for the hedge EA to find
+         GlobalVariableSet("PROP_HB_" + IntegerToString(Magic_Number), (double)TimeCurrent());
+         GlobalVariableSet("EASignal_Connected_"+IntegerToString(HedgeEA_Magic), (double)TimeCurrent());
+         Print("Main EA registered heartbeat with Magic: ", Magic_Number);
+         Print("Main EA looking for hedge with Magic: ", HedgeEA_Magic);
+      }
       else
       {
          // Test file creation for file-based communication
          string fileName = "Synergy_Signals.txt";
          int fileHandle = FileOpen(fileName, FILE_WRITE|FILE_TXT);
-         
+
          if(fileHandle != INVALID_HANDLE)
          {
             FileWriteString(fileHandle, "INIT,"+ IntegerToString(TimeCurrent()));
@@ -394,7 +378,25 @@ if(EnableHedgeCommunication)
          {
             Print("Failed to initialize file-based communication. Error: ", GetLastError());
             return(INIT_FAILED);
-            Print("SETTINGS VERIFICATION:");
+         }
+      }
+   }
+
+   EventSetTimer(HEARTBEAT_SEC);
+   SendHeartbeat(true);
+   linkWasOK = IsLinkAlive(true);
+
+   // Add diagnostic output of all global variables
+   Print("--- GLOBAL VARIABLES AT INIT ---");
+   for(int i=0; i<GlobalVariablesTotal(); i++) {
+      string name = GlobalVariableName(i);
+      double value = GlobalVariableGet(name);
+      Print(name, " = ", value);
+   }
+   Print("-------------------------------");
+
+   // Print initial settings for verification
+   Print("SETTINGS VERIFICATION:");
    Print("UseFixedLot = ", UseFixedLot ? "TRUE" : "FALSE");
    Print("FixedLotSize = ", FixedLotSize);
    Print("RiskPercent = ", RiskPercent);
@@ -403,13 +405,8 @@ if(EnableHedgeCommunication)
    Print("HedgeEA_Magic = ", HedgeEA_Magic);
    Print("EnableHedgeCommunication = ", EnableHedgeCommunication ? "TRUE" : "FALSE");
    Print("Synergy Strategy v1.01 initialised. Hedge factor:",DoubleToString(hedgeFactor,4));
+
    return(INIT_SUCCEEDED);
-   
-         }
-      }
-   }
-   
-   
 }
 
 //+------------------------------------------------------------------+
