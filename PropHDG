@@ -1,514 +1,279 @@
 //+------------------------------------------------------------------+
-//|                                                 PropEA\_HDG.mq5 |
+//|                                                    PropEA_HDG.mq5 |
+//|   Prop‑style Hedge Engine (paired with Synergy Strategy v1.01)   |
+//|                                                                  |
+//|  CHANGE LOG (v2.01 – 18‑May‑2025)                                |
+//|   • Added bidirectional heartbeat / link‑monitor                |
+//|   • Dashboard shows “Hedge Link OK / NOT OK” status             |
+//|   • Debug prints on link loss / recovery                        |
+//|   • Minor refactors – consts, helpers, tidy dashboard code      |
 //+------------------------------------------------------------------+
-\#property copyright "t2an1s"
-\#property link      "[http://www.yourwebsite.com](http://www.yourwebsite.com)"
-\#property version   "2.00"
-\#property strict
+#property copyright "t2an1s"
+#property link      "http://www.yourwebsite.com"
+#property version   "2.01"
+#property strict
 
-// Include necessary libraries
-\#include \<Trade\Trade.mqh>           // Trading functions
-
-// Create trade object for order operations
+#include <Trade\Trade.mqh>
 CTrade trade;
 
-//+------------------------------------------------------------------+
-//| Enumeration for Communication Method                              |
-//+------------------------------------------------------------------+
-enum ENUM\_COMMUNICATION\_METHOD {
-GLOBAL\_VARS,   // Global Variables
-FILE\_BASED     // File-Based
-};
+//────────────────────────────────────────────────────────────────────
+// 1. ENUMS & INPUTS
+//────────────────────────────────────────────────────────────────────
 
-// Input Parameters - General Settings
+enum ENUM_COMMUNICATION_METHOD { GLOBAL_VARS, FILE_BASED };
+
 input group "General Settings"
-input string    EA\_Name = "PropEA Hedge";              // EA Name
-input int       Magic\_Number = 789123;                 // Magic Number (must match main EA setting)
-input bool      EnableTrading = true;                  // Enable Trading
-input ENUM\_COMMUNICATION\_METHOD CommunicationMethod = GLOBAL\_VARS; // Communication Method
+input string    EA_Name               = "PropEA Hedge";   // display only
+input int       Magic_Number          = 789123;            // must match hedgeMagic in prop EA
+input bool      EnableTrading         = true;
+input ENUM_COMMUNICATION_METHOD CommunicationMethod = GLOBAL_VARS;
 
-// Input Parameters - Hedge Settings
 input group "Hedge Settings"
-input int       SourceEA\_Magic = 123456;               // Main Strategy EA Magic
+input int       SourceEA_Magic        = 123456;            // magic of main strategy EA
 
-// Input Parameters - Cost Recovery Settings
 input group "Cost Recovery Settings"
-input bool      EnableBleedFeature = true;             // Enable Hedge Bleed
-input double    MinimumLot = 0.01;                     // Minimum Lot Size
+input bool      EnableBleedFeature    = true;
+input double    MinimumLot            = 0.01;
 
-// Global variables
-double initialBalance;                                 // Starting balance
-bool   bleedDone = false;                              // Hedge bleed flag
+//────────────────────────────────────────────────────────────────────
+// 2. CONSTANTS & GLOBALS
+//────────────────────────────────────────────────────────────────────
 
-//+------------------------------------------------------------------+
-//| Expert initialization function                                    |
-//+------------------------------------------------------------------+
-int OnInit()
-{
-// Set trade parameters
-trade.SetExpertMagicNumber(Magic\_Number);
+// Heart‑beat parameters (same values as prop side)
+const int HEARTBEAT_SEC    = 5;
+const int LINK_TIMEOUT_SEC = 15;
 
-// Store initial balance
-initialBalance = AccountInfoDouble(ACCOUNT\_BALANCE);
+ulong lastPulseSent   = 0;   // when we last pinged
+bool  linkWasOK       = false;
 
-// Create dashboard
-CreateDashboard();
+// bleed flag (dashboard)
+bool  bleedDone       = false;
 
-Print("PropEA Hedge initialized.");
-return(INIT\_SUCCEEDED);
-}
+double initialBalance = 0;
 
-//+------------------------------------------------------------------+
-//| Expert deinitialization function                                 |
-//+------------------------------------------------------------------+
-void OnDeinit(const int reason)
-{
-// Clean up resources
-DeleteDashboard();
+// dashboard prefix
+string dash = "PropEA_Hedge_";
 
-Print("PropEA Hedge stopped. Reason: ", reason);
-}
-
-//+------------------------------------------------------------------+
-//| Expert tick function                                             |
-//+------------------------------------------------------------------+
-void OnTick()
-{
-// Skip if trading is disabled
-if(!EnableTrading) return;
-
-// Update dashboard
-UpdateDashboard();
-
-// Check for signals from main EA
-CheckForHedgeSignals();
-
-// Manage open hedge positions
-ManageHedgePositions();
-}
-
-//+------------------------------------------------------------------+
-//| Get tick count from a string (hash function)                     |
-//+------------------------------------------------------------------+
+//────────────────────────────────────────────────────────────────────
+// 3. HELPER – STRING HASH (shared with prop EA)
+//────────────────────────────────────────────────────────────────────
 ulong StringGetTickCount(string text)
 {
-ulong result = 0;
-for(int i = 0; i < StringLen(text); i++)
-{
-result += (ulong)StringGetCharacter(text, i);
-}
-return result;
+   ulong r=0; for(int i=0;i<StringLen(text);i++) r+=(ulong)StringGetCharacter(text,i);
+   return r;
 }
 
-//+------------------------------------------------------------------+
-//| Check for hedge signals from main EA                             |
-//+------------------------------------------------------------------+
+//────────────────────────────────────────────────────────────────────
+// 4. HEART‑BEAT HELPERS
+//────────────────────────────────────────────────────────────────────
+void SendHeartbeat()
+{
+   string name = "HEDGE_HB_" + IntegerToString(Magic_Number);
+   GlobalVariableSet(name,(double)TimeCurrent());
+   lastPulseSent = (ulong)TimeCurrent();
+}
+
+bool IsLinkAlive()
+{
+   string peer = "PROP_HB_" + IntegerToString(SourceEA_Magic);
+   if(!GlobalVariableCheck(peer)) return false;
+   double ts = GlobalVariableGet(peer);
+   return ((TimeCurrent() - (datetime)ts) <= LINK_TIMEOUT_SEC);
+}
+
+//────────────────────────────────────────────────────────────────────
+// 5. INIT / DEINIT
+//────────────────────────────────────────────────────────────────────
+int OnInit()
+{
+   trade.SetExpertMagicNumber(Magic_Number);
+   initialBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+
+   CreateDashboard();
+
+   // start heartbeat timer
+   EventSetTimer(HEARTBEAT_SEC);
+   SendHeartbeat();
+   linkWasOK = IsLinkAlive();
+   Print("PropEA Hedge initialised. Link ", linkWasOK?"OK ✅":"NOT OK ❌");
+   return(INIT_SUCCEEDED);
+}
+
+void OnDeinit(const int reason)
+{
+   EventKillTimer();
+   DeleteDashboard();
+   Print("PropEA Hedge stopped. Reason: ", reason);
+}
+
+//────────────────────────────────────────────────────────────────────
+// 6. TIMER – pulse & link monitor
+//────────────────────────────────────────────────────────────────────
+void OnTimer()
+{
+   SendHeartbeat();
+   bool ok = IsLinkAlive();
+   if(ok!=linkWasOK)
+   {
+      Print("Hedge link is now ", ok?"OK ✅":"NOT OK ❌");
+      linkWasOK = ok;
+   }
+}
+
+//────────────────────────────────────────────────────────────────────
+// 7. ONTICK MAIN LOOP
+//────────────────────────────────────────────────────────────────────
+void OnTick()
+{
+   if(!EnableTrading) return;
+
+   UpdateDashboard();
+
+   // only process hedge traffic if link alive
+   if(!IsLinkAlive()) return;
+
+   CheckForHedgeSignals();
+   ManageHedgePositions();
+}
+
+//────────────────────────────────────────────────────────────────────
+// 8. COMMUNICATION LAYER (read signals)
+//────────────────────────────────────────────────────────────────────
+
+void ProcessSignal(string signalType,string direction,double volume,double tp,double sl); // fwd decl
+
 void CheckForHedgeSignals()
 {
-// Check if there's a signal from the main EA
-if(CommunicationMethod == GLOBAL\_VARS)
-{
-// Check if a new signal exists via timestamp
-datetime signalTime = 0;
-if(GlobalVariableCheck("EASignal\_Time\_"+IntegerToString(SourceEA\_Magic)))
-signalTime = (datetime)GlobalVariableGet("EASignal\_Time\_"+IntegerToString(SourceEA\_Magic));
+   if(CommunicationMethod==GLOBAL_VARS)
+   {
+      string base= IntegerToString(SourceEA_Magic);
+      if(!GlobalVariableCheck("EASignal_Time_"+base)) return;
+      datetime sigTime=(datetime)GlobalVariableGet("EASignal_Time_"+base);
+      static datetime last=0; if(sigTime==0||sigTime==last) return;
 
-```
-  static datetime lastProcessedTime = 0;
-  
-  if(signalTime > 0 && signalTime != lastProcessedTime)
-  {
-     // Get signal details
-     string signalType = "";
-     ulong typeCode = 0;
-     
-     if(GlobalVariableCheck("EASignal_Type_"+IntegerToString(SourceEA_Magic)))
-        typeCode = (ulong)GlobalVariableGet("EASignal_Type_"+IntegerToString(SourceEA_Magic));
-     
-     // Convert type code back to string based on known signal types
-     if(typeCode == StringGetTickCount("OPEN")) signalType = "OPEN";
-     else if(typeCode == StringGetTickCount("MODIFY")) signalType = "MODIFY";
-     else if(typeCode == StringGetTickCount("PARTIAL_CLOSE")) signalType = "PARTIAL_CLOSE";
-     else if(typeCode == StringGetTickCount("BLEED")) signalType = "BLEED";
-     
-     // Get direction
-     string direction = "";
-     ulong dirCode = 0;
-     
-     if(GlobalVariableCheck("EASignal_Direction_"+IntegerToString(SourceEA_Magic)))
-        dirCode = (ulong)GlobalVariableGet("EASignal_Direction_"+IntegerToString(SourceEA_Magic));
-     
-     if(dirCode == StringGetTickCount("BUY")) direction = "BUY";
-     else if(dirCode == StringGetTickCount("SELL")) direction = "SELL";
-     
-     // Get other parameters
-     double volume = 0, sl = 0, tp = 0;
-     
-     if(GlobalVariableCheck("EASignal_Volume_"+IntegerToString(SourceEA_Magic)))
-        volume = GlobalVariableGet("EASignal_Volume_"+IntegerToString(SourceEA_Magic));
-     
-     if(GlobalVariableCheck("EASignal_SL_"+IntegerToString(SourceEA_Magic)))
-        sl = GlobalVariableGet("EASignal_SL_"+IntegerToString(SourceEA_Magic));
-     
-     if(GlobalVariableCheck("EASignal_TP_"+IntegerToString(SourceEA_Magic)))
-        tp = GlobalVariableGet("EASignal_TP_"+IntegerToString(SourceEA_Magic));
-     
-     // Only process if we have a valid signal type and direction
-     if(signalType != "" && direction != "")
-     {
-        // Process signal
-        ProcessSignal(signalType, direction, volume, tp, sl);
-        
-        // Update last processed time
-        lastProcessedTime = signalTime;
-     }
-  }
-```
+      ulong typeCode =(ulong)GlobalVariableGet("EASignal_Type_"+base);
+      ulong dirCode  =(ulong)GlobalVariableGet("EASignal_Direction_"+base);
+      double vol     =      GlobalVariableGet("EASignal_Volume_"+base);
+      double sl      =      GlobalVariableGet("EASignal_SL_"+base);
+      double tp      =      GlobalVariableGet("EASignal_TP_"+base);
 
-}
-else // File-based communication
-{
-string fileName = "EURUSD\_Synergy\_Signals.txt";
-if(FileIsExist(fileName))
-{
-int fileHandle = FileOpen(fileName, FILE\_READ|FILE\_TXT);
-if(fileHandle != INVALID\_HANDLE)
-{
-string content = FileReadString(fileHandle);
-FileClose(fileHandle);
+      string sType="", dir="";
+      if(typeCode==StringGetTickCount("OPEN"))          sType="OPEN";
+      else if(typeCode==StringGetTickCount("MODIFY"))   sType="MODIFY";
+      else if(typeCode==StringGetTickCount("PARTIAL_CLOSE")) sType="PARTIAL_CLOSE";
+      else if(typeCode==StringGetTickCount("BLEED"))    sType="BLEED";
 
-```
-        // Delete file to avoid re-processing
-        FileDelete(fileName);
-        
-        // Parse signal data using the built-in StringSplit function
-        string parts[];
-        int count = StringSplit(content, ',', parts);
-        
-        if(count >= 6)
-        {
-           string signalType = parts[0];
-           string direction = parts[1];
-           double volume = StringToDouble(parts[2]);
-           double tp = StringToDouble(parts[3]);
-           double sl = StringToDouble(parts[4]);
-           
-           // Process signal
-           ProcessSignal(signalType, direction, volume, tp, sl);
-        }
-     }
-  }
-```
+      if(dirCode==StringGetTickCount("BUY"))  dir="BUY";
+      else if(dirCode==StringGetTickCount("SELL")) dir="SELL";
 
-}
+      if(sType!="" && dir!="")
+         ProcessSignal(sType,dir,vol,tp,sl);
+
+      last=sigTime;
+   }
+   else // FILE_BASED
+   {
+      string file="EURUSD_Synergy_Signals.txt";
+      if(!FileIsExist(file)) return;
+      int h=FileOpen(file,FILE_READ|FILE_TXT); if(h==INVALID_HANDLE) return;
+      string content=FileReadString(h); FileClose(h); FileDelete(file);
+      string p[]; if(StringSplit(content,',',p)<6) return;
+      ProcessSignal(p[0],p[1],StringToDouble(p[2]),StringToDouble(p[3]),StringToDouble(p[4]));
+   }
 }
 
-//+------------------------------------------------------------------+
-//| Process incoming hedge signal                                    |
-//+------------------------------------------------------------------+
-void ProcessSignal(string signalType, string direction, double volume, double tp, double sl)
+//────────────────────────────────────────────────────────────────────
+// 9. EXECUTE/UPDATE/CLOSE TRADES
+//────────────────────────────────────────────────────────────────────
+void ProcessSignal(string signalType,string direction,double volume,double tp,double sl)
 {
-if(signalType == "OPEN")
-{
-// Open new hedge position
-if(direction == "BUY" && volume > 0)
-{
-if(volume < MinimumLot) volume = MinimumLot;
-trade.Buy(volume, \_Symbol, 0, sl, tp, "Hedge");
-Print("Hedge: Opened BUY position, Volume: ", volume, ", SL: ", sl, ", TP: ", tp);
-}
-else if(direction == "SELL" && volume > 0)
-{
-if(volume < MinimumLot) volume = MinimumLot;
-trade.Sell(volume, \_Symbol, 0, sl, tp, "Hedge");
-Print("Hedge: Opened SELL position, Volume: ", volume, ", SL: ", sl, ", TP: ", tp);
-}
-}
-else if(signalType == "MODIFY")
-{
-// Modify existing position
-for(int i = 0; i < PositionsTotal(); i++)
-{
-ulong ticket = PositionGetTicket(i);
-if(ticket && PositionSelectByTicket(ticket))
-{
-if(PositionGetString(POSITION\_SYMBOL) == \_Symbol &&
-PositionGetInteger(POSITION\_MAGIC) == Magic\_Number)
-{
-trade.PositionModify(ticket, sl, tp);
-Print("Hedge: Modified position, SL: ", sl, ", TP: ", tp);
-break;
-}
-}
-}
-}
-else if(signalType == "PARTIAL\_CLOSE" && volume > 0)
-{
-// Partially close position
-for(int i = 0; i < PositionsTotal(); i++)
-{
-ulong ticket = PositionGetTicket(i);
-if(ticket && PositionSelectByTicket(ticket))
-{
-if(PositionGetString(POSITION\_SYMBOL) == \_Symbol &&
-PositionGetInteger(POSITION\_MAGIC) == Magic\_Number)
-{
-if(volume < MinimumLot) volume = MinimumLot;
-trade.PositionClosePartial(ticket, volume);
-Print("Hedge: Partially closed position, Volume: ", volume);
-break;
-}
-}
-}
-}
-else if(signalType == "BLEED" && volume > 0 && EnableBleedFeature)
-{
-// Execute hedge bleed (close 50% of hedge)
-for(int i = 0; i < PositionsTotal(); i++)
-{
-ulong ticket = PositionGetTicket(i);
-if(ticket && PositionSelectByTicket(ticket))
-{
-if(PositionGetString(POSITION\_SYMBOL) == \_Symbol &&
-PositionGetInteger(POSITION\_MAGIC) == Magic\_Number)
-{
-if(volume < MinimumLot) volume = MinimumLot;
-trade.PositionClosePartial(ticket, volume);
-Print("Hedge: Executed hedge bleed, Volume: ", volume);
-bleedDone = true;
-break;
-}
-}
-}
-}
+   if(volume<MinimumLot && volume>0) volume=MinimumLot;
+
+   if(signalType=="OPEN")
+   {
+      if(direction=="BUY" && volume>0)
+         trade.Buy(volume,_Symbol,0,sl,tp,"Hedge");
+      else if(direction=="SELL"&& volume>0)
+         trade.Sell(volume,_Symbol,0,sl,tp,"Hedge");
+      Print("Hedge OPEN ",direction," ",DoubleToString(volume,2));
+   }
+   else if(signalType=="MODIFY")
+   {
+      for(int i=0;i<PositionsTotal();i++)
+         if(PositionSelectByTicket(PositionGetTicket(i)))
+            if(PositionGetInteger(POSITION_MAGIC)==Magic_Number && PositionGetString(POSITION_SYMBOL)==_Symbol)
+            {
+               trade.PositionModify(PositionGetTicket(i),sl,tp);
+               Print("Hedge MODIFY SL/TP");
+               break;
+            }
+   }
+   else if((signalType=="PARTIAL_CLOSE"||signalType=="BLEED") && volume>0)
+   {
+      for(int i=0;i<PositionsTotal();i++)
+         if(PositionSelectByTicket(PositionGetTicket(i)))
+            if(PositionGetInteger(POSITION_MAGIC)==Magic_Number && PositionGetString(POSITION_SYMBOL)==_Symbol)
+            {
+               trade.PositionClosePartial(PositionGetTicket(i),volume);
+               Print("Hedge ",signalType," closed ",DoubleToString(volume,2));
+               if(signalType=="BLEED") bleedDone=true;
+               break;
+            }
+   }
 }
 
-//+------------------------------------------------------------------+
-//| Manage hedge positions                                           |
-//+------------------------------------------------------------------+
+// simple housekeeping print (optional)
 void ManageHedgePositions()
 {
-// This function monitors existing hedge positions
-// For now, it just ensures the positions match with what's expected
-
-// Get current hedge status
-int hedgeCount = 0;
-double totalHedgeVolume = 0;
-
-for(int i = 0; i < PositionsTotal(); i++)
-{
-ulong ticket = PositionGetTicket(i);
-if(ticket && PositionSelectByTicket(ticket))
-{
-if(PositionGetString(POSITION\_SYMBOL) == \_Symbol &&
-PositionGetInteger(POSITION\_MAGIC) == Magic\_Number)
-{
-hedgeCount++;
-totalHedgeVolume += PositionGetDouble(POSITION\_VOLUME);
-}
-}
+   static datetime last=0; if(TimeCurrent()-last<60) return; last=TimeCurrent();
+   int cnt=0; double vol=0;
+   for(int i=0;i<PositionsTotal();i++)
+      if(PositionSelectByTicket(PositionGetTicket(i)))
+         if(PositionGetInteger(POSITION_MAGIC)==Magic_Number && PositionGetString(POSITION_SYMBOL)==_Symbol)
+         { cnt++; vol+=PositionGetDouble(POSITION_VOLUME);}  
+   Print("Active hedge pos: ",cnt," total ",DoubleToString(vol,2)," lots");
 }
 
-// Log current hedge state (every 60 seconds to avoid log spam)
-static datetime lastLogTime = 0;
-if(hedgeCount > 0 && TimeCurrent() - lastLogTime > 60)
-{
-Print("Managing ", hedgeCount, " hedge positions with total volume ",
-DoubleToString(totalHedgeVolume, 2));
-lastLogTime = TimeCurrent();
-}
+//────────────────────────────────────────────────────────────────────
+// 10. DASHBOARD (very lightweight)
+//────────────────────────────────────────────────────────────────────
+void CreateLabel(string name,string txt,int x,int y,color c){
+   ObjectCreate(0,name,OBJ_LABEL,0,0,0);
+   ObjectSetInteger(0,name,OBJPROP_XDISTANCE,x);
+   ObjectSetInteger(0,name,OBJPROP_YDISTANCE,y);
+   ObjectSetString (0,name,OBJPROP_TEXT,txt);
+   ObjectSetInteger(0,name,OBJPROP_COLOR,c);
+   ObjectSetInteger(0,name,OBJPROP_CORNER,CORNER_LEFT_UPPER);
 }
 
-//+------------------------------------------------------------------+
-//| Create dashboard                                                 |
-//+------------------------------------------------------------------+
 void CreateDashboard()
 {
-// Visual elements to create PropEA-style dashboard
-string prefix = "PropEA\_Hedge\_";
+   DeleteDashboard();
+   ObjectCreate(0,dash+"bg",OBJ_RECTANGLE_LABEL,0,0,0);
+   ObjectSetInteger(0,dash+"bg",OBJPROP_XDISTANCE,20);
+   ObjectSetInteger(0,dash+"bg",OBJPROP_YDISTANCE,20);
+   ObjectSetInteger(0,dash+"bg",OBJPROP_XSIZE,260);
+   ObjectSetInteger(0,dash+"bg",OBJPROP_YSIZE,120);
+   ObjectSetInteger(0,dash+"bg",OBJPROP_BGCOLOR,clrNavy);
+   ObjectSetInteger(0,dash+"bg",OBJPROP_STYLE,STYLE_SOLID);
+   ObjectSetInteger(0,dash+"bg",OBJPROP_HIDDEN,true);
 
-// Clean up any existing objects first
-DeleteDashboard();
-
-// Main background panel
-ObjectCreate(0, prefix+"Background", OBJ\_RECTANGLE\_LABEL, 0, 0, 0);
-ObjectSetInteger(0, prefix+"Background", OBJPROP\_XDISTANCE, 20);
-ObjectSetInteger(0, prefix+"Background", OBJPROP\_YDISTANCE, 20);
-ObjectSetInteger(0, prefix+"Background", OBJPROP\_XSIZE, 300);
-ObjectSetInteger(0, prefix+"Background", OBJPROP\_YSIZE, 200);
-ObjectSetInteger(0, prefix+"Background", OBJPROP\_BGCOLOR, clrNavy);
-ObjectSetInteger(0, prefix+"Background", OBJPROP\_BORDER\_TYPE, BORDER\_FLAT);
-ObjectSetInteger(0, prefix+"Background", OBJPROP\_CORNER, CORNER\_LEFT\_UPPER);
-ObjectSetInteger(0, prefix+"Background", OBJPROP\_STYLE, STYLE\_SOLID);
-ObjectSetInteger(0, prefix+"Background", OBJPROP\_WIDTH, 1);
-ObjectSetInteger(0, prefix+"Background", OBJPROP\_BACK, false);
-ObjectSetInteger(0, prefix+"Background", OBJPROP\_SELECTABLE, false);
-ObjectSetInteger(0, prefix+"Background", OBJPROP\_SELECTED, false);
-ObjectSetInteger(0, prefix+"Background", OBJPROP\_HIDDEN, true);
-ObjectSetInteger(0, prefix+"Background", OBJPROP\_ZORDER, 0);
-
-// Header background
-ObjectCreate(0, prefix+"HeaderBg", OBJ\_RECTANGLE\_LABEL, 0, 0, 0);
-ObjectSetInteger(0, prefix+"HeaderBg", OBJPROP\_XDISTANCE, 20);
-ObjectSetInteger(0, prefix+"HeaderBg", OBJPROP\_YDISTANCE, 20);
-ObjectSetInteger(0, prefix+"HeaderBg", OBJPROP\_XSIZE, 300);
-ObjectSetInteger(0, prefix+"HeaderBg", OBJPROP\_YSIZE, 30);
-ObjectSetInteger(0, prefix+"HeaderBg", OBJPROP\_BGCOLOR, clrGold);
-ObjectSetInteger(0, prefix+"HeaderBg", OBJPROP\_BORDER\_TYPE, BORDER\_FLAT);
-ObjectSetInteger(0, prefix+"HeaderBg", OBJPROP\_CORNER, CORNER\_LEFT\_UPPER);
-ObjectSetInteger(0, prefix+"HeaderBg", OBJPROP\_STYLE, STYLE\_SOLID);
-ObjectSetInteger(0, prefix+"HeaderBg", OBJPROP\_WIDTH, 1);
-ObjectSetInteger(0, prefix+"HeaderBg", OBJPROP\_BACK, false);
-ObjectSetInteger(0, prefix+"HeaderBg", OBJPROP\_SELECTABLE, false);
-ObjectSetInteger(0, prefix+"HeaderBg", OBJPROP\_SELECTED, false);
-ObjectSetInteger(0, prefix+"HeaderBg", OBJPROP\_HIDDEN, true);
-ObjectSetInteger(0, prefix+"HeaderBg", OBJPROP\_ZORDER, 1);
-
-// Title
-ObjectCreate(0, prefix+"Title", OBJ\_LABEL, 0, 0, 0);
-ObjectSetInteger(0, prefix+"Title", OBJPROP\_XDISTANCE, 170);
-ObjectSetInteger(0, prefix+"Title", OBJPROP\_YDISTANCE, 35);
-ObjectSetString(0, prefix+"Title", OBJPROP\_TEXT, "PropEA Hedge Module");
-ObjectSetInteger(0, prefix+"Title", OBJPROP\_COLOR, clrBlack);
-ObjectSetInteger(0, prefix+"Title", OBJPROP\_FONTSIZE, 12);
-ObjectSetInteger(0, prefix+"Title", OBJPROP\_ANCHOR, ANCHOR\_CENTER);
-
-// Status info section
-int y = 60;
-// Section header
-ObjectCreate(0, prefix+"InfoHeader", OBJ\_RECTANGLE\_LABEL, 0, 0, 0);
-ObjectSetInteger(0, prefix+"InfoHeader", OBJPROP\_XDISTANCE, 20);
-ObjectSetInteger(0, prefix+"InfoHeader", OBJPROP\_YDISTANCE, y);
-ObjectSetInteger(0, prefix+"InfoHeader", OBJPROP\_XSIZE, 300);
-ObjectSetInteger(0, prefix+"InfoHeader", OBJPROP\_YSIZE, 20);
-ObjectSetInteger(0, prefix+"InfoHeader", OBJPROP\_BGCOLOR, clrBlack);
-ObjectSetInteger(0, prefix+"InfoHeader", OBJPROP\_BORDER\_TYPE, BORDER\_FLAT);
-ObjectSetInteger(0, prefix+"InfoHeader", OBJPROP\_CORNER, CORNER\_LEFT\_UPPER);
-ObjectSetInteger(0, prefix+"InfoHeader", OBJPROP\_STYLE, STYLE\_SOLID);
-
-ObjectCreate(0, prefix+"InfoTitle", OBJ\_LABEL, 0, 0, 0);
-ObjectSetInteger(0, prefix+"InfoTitle", OBJPROP\_XDISTANCE, 170);
-ObjectSetInteger(0, prefix+"InfoTitle", OBJPROP\_YDISTANCE, y+10);
-ObjectSetString(0, prefix+"InfoTitle", OBJPROP\_TEXT, "Hedge Status");
-ObjectSetInteger(0, prefix+"InfoTitle", OBJPROP\_COLOR, clrWhite);
-ObjectSetInteger(0, prefix+"InfoTitle", OBJPROP\_FONTSIZE, 10);
-ObjectSetInteger(0, prefix+"InfoTitle", OBJPROP\_ANCHOR, ANCHOR\_CENTER);
-
-y += 25;
-
-// Magic Number
-ObjectCreate(0, prefix+"MagicLabel", OBJ\_LABEL, 0, 0, 0);
-ObjectSetInteger(0, prefix+"MagicLabel", OBJPROP\_XDISTANCE, 30);
-ObjectSetInteger(0, prefix+"MagicLabel", OBJPROP\_YDISTANCE, y);
-ObjectSetString(0, prefix+"MagicLabel", OBJPROP\_TEXT, "Magic Number:");
-ObjectSetInteger(0, prefix+"MagicLabel", OBJPROP\_COLOR, clrWhite);
-
-ObjectCreate(0, prefix+"MagicValue", OBJ\_LABEL, 0, 0, 0);
-ObjectSetInteger(0, prefix+"MagicValue", OBJPROP\_XDISTANCE, 150);
-ObjectSetInteger(0, prefix+"MagicValue", OBJPROP\_YDISTANCE, y);
-ObjectSetString(0, prefix+"MagicValue", OBJPROP\_TEXT, IntegerToString(Magic\_Number));
-ObjectSetInteger(0, prefix+"MagicValue", OBJPROP\_COLOR, clrLimeGreen);
-
-y += 20;
-
-// Source EA Magic
-ObjectCreate(0, prefix+"SourceLabel", OBJ\_LABEL, 0, 0, 0);
-ObjectSetInteger(0, prefix+"SourceLabel", OBJPROP\_XDISTANCE, 30);
-ObjectSetInteger(0, prefix+"SourceLabel", OBJPROP\_YDISTANCE, y);
-ObjectSetString(0, prefix+"SourceLabel", OBJPROP\_TEXT, "Source EA Magic:");
-ObjectSetInteger(0, prefix+"SourceLabel", OBJPROP\_COLOR, clrWhite);
-
-ObjectCreate(0, prefix+"SourceValue", OBJ\_LABEL, 0, 0, 0);
-ObjectSetInteger(0, prefix+"SourceValue", OBJPROP\_XDISTANCE, 150);
-ObjectSetInteger(0, prefix+"SourceValue", OBJPROP\_YDISTANCE, y);
-ObjectSetString(0, prefix+"SourceValue", OBJPROP\_TEXT, IntegerToString(SourceEA\_Magic));
-ObjectSetInteger(0, prefix+"SourceValue", OBJPROP\_COLOR, clrLimeGreen);
-
-y += 20;
-
-// Communication Type
-ObjectCreate(0, prefix+"CommLabel", OBJ\_LABEL, 0, 0, 0);
-ObjectSetInteger(0, prefix+"CommLabel", OBJPROP\_XDISTANCE, 30);
-ObjectSetInteger(0, prefix+"CommLabel", OBJPROP\_YDISTANCE, y);
-ObjectSetString(0, prefix+"CommLabel", OBJPROP\_TEXT, "Communication:");
-ObjectSetInteger(0, prefix+"CommLabel", OBJPROP\_COLOR, clrWhite);
-
-ObjectCreate(0, prefix+"CommValue", OBJ\_LABEL, 0, 0, 0);
-ObjectSetInteger(0, prefix+"CommValue", OBJPROP\_XDISTANCE, 150);
-ObjectSetInteger(0, prefix+"CommValue", OBJPROP\_YDISTANCE, y);
-ObjectSetString(0, prefix+"CommValue", OBJPROP\_TEXT,
-CommunicationMethod == GLOBAL\_VARS ? "Global Variables" : "File-Based");
-ObjectSetInteger(0, prefix+"CommValue", OBJPROP\_COLOR, clrLimeGreen);
-
-y += 20;
-
-// Bleed Status
-ObjectCreate(0, prefix+"BleedLabel", OBJ\_LABEL, 0, 0, 0);
-ObjectSetInteger(0, prefix+"BleedLabel", OBJPROP\_XDISTANCE, 30);
-ObjectSetInteger(0, prefix+"BleedLabel", OBJPROP\_YDISTANCE, y);
-ObjectSetString(0, prefix+"BleedLabel", OBJPROP\_TEXT, "Bleed Status:");
-ObjectSetInteger(0, prefix+"BleedLabel", OBJPROP\_COLOR, clrWhite);
-
-ObjectCreate(0, prefix+"BleedValue", OBJ\_LABEL, 0, 0, 0);
-ObjectSetInteger(0, prefix+"BleedValue", OBJPROP\_XDISTANCE, 150);
-ObjectSetInteger(0, prefix+"BleedValue", OBJPROP\_YDISTANCE, y);
-ObjectSetString(0, prefix+"BleedValue", OBJPROP\_TEXT, bleedDone ? "Executed" : "Pending");
-ObjectSetInteger(0, prefix+"BleedValue", OBJPROP\_COLOR, bleedDone ? clrLimeGreen : clrRed);
+   CreateLabel(dash+"title","PropEA Hedge", 150,35, clrGold);
+   CreateLabel(dash+"linkL","Link",   40,70, clrWhite);
+   CreateLabel(dash+"linkV","--",    120,70, clrRed);
+   CreateLabel(dash+"bleedL","Bleed", 40,90, clrWhite);
+   CreateLabel(dash+"bleedV","Pending",120,90, clrRed);
 }
 
-//+------------------------------------------------------------------+
-//| Update dashboard                                                 |
-//+------------------------------------------------------------------+
 void UpdateDashboard()
 {
-string prefix = "PropEA\_Hedge\_";
+   color okCol = IsLinkAlive()?clrLime:clrRed;
+   string txt  = IsLinkAlive()?"OK":"NOT OK";
+   ObjectSetString (0,dash+"linkV",OBJPROP_TEXT ,txt);
+   ObjectSetInteger(0,dash+"linkV",OBJPROP_COLOR,okCol);
 
-// Update bleed status
-ObjectSetString(0, prefix+"BleedValue", OBJPROP\_TEXT, bleedDone ? "Executed" : "Pending");
-ObjectSetInteger(0, prefix+"BleedValue", OBJPROP\_COLOR, bleedDone ? clrLimeGreen : clrRed);
-
-// Count active positions
-int posCount = 0;
-double totalVolume = 0;
-for(int i = 0; i < PositionsTotal(); i++)
-{
-ulong ticket = PositionGetTicket(i);
-if(ticket && PositionSelectByTicket(ticket))
-{
-if(PositionGetString(POSITION\_SYMBOL) == \_Symbol &&
-PositionGetInteger(POSITION\_MAGIC) == Magic\_Number)
-{
-posCount++;
-totalVolume += PositionGetDouble(POSITION\_VOLUME);
-}
-}
+   ObjectSetString (0,dash+"bleedV",OBJPROP_TEXT , bleedDone?"Executed":"Pending");
+   ObjectSetInteger(0,dash+"bleedV",OBJPROP_COLOR, bleedDone?clrLime:clrRed);
 }
 
-// Add position count info
-if(!ObjectFind(0, prefix+"PosLabel"))
-{
-ObjectCreate(0, prefix+"PosLabel", OBJ\_LABEL, 0, 0, 0);
-ObjectSetInteger(0, prefix+"PosLabel", OBJPROP\_XDISTANCE, 30);
-ObjectSetInteger(0, prefix+"PosLabel", OBJPROP\_YDISTANCE, 160);
-ObjectSetString(0, prefix+"PosLabel", OBJPROP\_TEXT, "Active Hedges:");
-ObjectSetInteger(0, prefix+"PosLabel", OBJPROP\_COLOR, clrWhite);
-
-ObjectCreate(0, prefix+"PosValue", OBJ_LABEL, 0, 0, 0);
-ObjectSetInteger(0, prefix+"PosValue", OBJPROP_XDISTANCE, 150);
-ObjectSetInteger(0, prefix+"PosValue", OBJPROP_YDISTANCE, 160);
-ObjectSetInteger(0, prefix+"PosValue", OBJPROP_COLOR, clrLimeGreen);
-
-
-}
-
-ObjectSetString(0, prefix+"PosValue", OBJPROP\_TEXT,
-IntegerToString(posCount) + " (" + DoubleToString(totalVolume, 2) + " lots)");
-}
-
-//+------------------------------------------------------------------+
-//| Delete dashboard                                                 |
-//+------------------------------------------------------------------+
-void DeleteDashboard()
-{
-ObjectsDeleteAll(0, "PropEA\_Hedge\_");
-}
+void DeleteDashboard(){ ObjectsDeleteAll(0,dash); }
