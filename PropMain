@@ -48,6 +48,9 @@ const int    LINK_TIMEOUT_SEC = 15;         // grace window before status = NOT 
 ulong        lastPulseSent    = 0;          // when we last pinged the other side
 bool         linkWasOK        = false;      // remembers previous state for debug prints
 
+// path to the shared signal file when FILE_BASED communication is used
+string       SignalFilePath   = "";
+
 
 //--------------------------------------------------------------------
 // 2.  UTILITY — indicator buffer guard                               
@@ -364,19 +367,22 @@ int OnInit()
       }
       else
       {
+         // Prepare path in the terminal's common data folder
+         SignalFilePath = TerminalInfoString(TERMINAL_COMMONDATA_PATH) + "\\Synergy_Signals.txt";
          // Test file creation for file-based communication
-         string fileName = "Synergy_Signals.txt";
-         int fileHandle = FileOpen(fileName, FILE_WRITE|FILE_TXT);
+         int fileHandle = FileOpen(SignalFilePath, FILE_WRITE|FILE_TXT);
 
          if(fileHandle != INVALID_HANDLE)
          {
             FileWriteString(fileHandle, "INIT,"+ IntegerToString(TimeCurrent()));
             FileClose(fileHandle);
-            Print("Hedge communication enabled (File-Based). Target EA Magic: ", HedgeEA_Magic);
+            Print("Hedge communication enabled (File-Based) via ", SignalFilePath,
+                  ". Target EA Magic: ", HedgeEA_Magic);
          }
          else
          {
-            Print("Failed to initialize file-based communication. Error: ", GetLastError());
+            Print("Failed to initialize file-based communication at ", SignalFilePath,
+                  ". Error: ", GetLastError());
             return(INIT_FAILED);
          }
       }
@@ -1948,8 +1954,9 @@ void SendHedgeSignal(string signalType, string direction, double volume, double 
    else
    {
       // Use file-based communication
-      string fileName = "Synergy_Signals.txt";
-      int fileHandle = FileOpen(fileName, FILE_WRITE|FILE_TXT);
+      if(SignalFilePath=="")
+         SignalFilePath = TerminalInfoString(TERMINAL_COMMONDATA_PATH) + "\\Synergy_Signals.txt";
+      int fileHandle = FileOpen(SignalFilePath, FILE_WRITE|FILE_TXT);
       
       if(fileHandle != INVALID_HANDLE)
       {
@@ -1962,10 +1969,11 @@ void SendHedgeSignal(string signalType, string direction, double volume, double 
                              
          FileWriteString(fileHandle, signalData);
          FileClose(fileHandle);
+         Print("Signal file written to ", SignalFilePath);
       }
       else
       {
-         Print("Error opening signal file: ", GetLastError());
+         Print("Error opening signal file at ", SignalFilePath, ": ", GetLastError());
       }
    }
 }
