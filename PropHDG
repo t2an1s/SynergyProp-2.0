@@ -1,0 +1,287 @@
+//+------------------------------------------------------------------+
+//|                                                 PropEA\_HDG.mq5  |
+//|              Revised Hedge EA with full dashboard & signal API   |
+//+------------------------------------------------------------------+
+\#property copyright "t2an1s"
+\#property link      "[http://www.yourwebsite.com](http://www.yourwebsite.com)"
+\#property version   "2.01"
+\#property strict
+
+\#include \<Trade\Trade.mqh>           // Trading functions
+CTrade trade;
+
+//--- Communication methods
+enum ENUM\_COMMUNICATION\_METHOD { GLOBAL\_VARS, FILE\_BASED };
+
+//--- Inputs: general
+input string    EA\_Name             = "PropEA Hedge";
+input int       Magic\_Number        = 789123;                // Hedge EA magic
+input bool      EnableTrading       = true;
+input ENUM\_COMMUNICATION\_METHOD CommunicationMethod = GLOBAL\_VARS;
+
+//--- Inputs: hedge settings
+input int       SourceEA\_Magic      = 123456;                // Main EA magic
+input bool      EnableBleedFeature  = true;
+input double    MinimumLot          = 0.01;
+
+//--- Globals
+double  initialBalance = 0;
+bool    bleedDone = false;
+time\_t  lastSignalTime = 0;
+
+//--- Forward declarations
+ulong  HashString(string s);
+void   CreateDashboard();
+void   UpdateDashboard();
+void   DeleteDashboard();
+void   CheckForHedgeSignals();
+void   ProcessSignal(string signalType, string direction, double volume, double tp, double sl);
+void   ManageHedgePositions();
+
+//+------------------------------------------------------------------+
+//| Expert initialization                                           |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+trade.SetExpertMagicNumber(Magic\_Number);
+initialBalance = AccountInfoDouble(ACCOUNT\_BALANCE);
+CreateDashboard();
+Print(EA\_Name, " initialized. Hedge magic: ", Magic\_Number);
+return INIT\_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization                                         |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+DeleteDashboard();
+Print(EA\_Name, " stopped. Reason: ", reason);
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick                                                     |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+if(!EnableTrading) return;
+UpdateDashboard();
+CheckForHedgeSignals();
+ManageHedgePositions();
+}
+
+//+------------------------------------------------------------------+
+//| Hash string to ulong                                            |
+//+------------------------------------------------------------------+
+ulong HashString(string s)
+{
+ulong h=0;
+for(int i=0;i\<StringLen(s);i++)
+h += (ulong)StringGetCharacter(s,i);
+return h;
+}
+
+//+------------------------------------------------------------------+
+//| Create on-chart dashboard                                        |
+//+------------------------------------------------------------------+
+void CreateDashboard()
+{
+string pfx="PropEA\_Hedge\_";
+DeleteDashboard();
+// background
+ObjectCreate(0,pfx+"BG",OBJ\_RECTANGLE\_LABEL,0,0,0);
+ObjectSetInteger(0,pfx+"BG",OBJPROP\_XDISTANCE,20);
+ObjectSetInteger(0,pfx+"BG",OBJPROP\_YDISTANCE,20);
+ObjectSetInteger(0,pfx+"BG",OBJPROP\_XSIZE,300);
+ObjectSetInteger(0,pfx+"BG",OBJPROP\_YSIZE,160);
+ObjectSetInteger(0,pfx+"BG",OBJPROP\_BACK,false);
+// header
+ObjectCreate(0,pfx+"Title",OBJ\_LABEL,0,0,0);
+ObjectSetInteger(0,pfx+"Title",OBJPROP\_XDISTANCE,170);
+ObjectSetInteger(0,pfx+"Title",OBJPROP\_YDISTANCE,35);
+ObjectSetString(0,pfx+"Title",OBJPROP\_TEXT,EA\_Name+" Module");
+ObjectSetInteger(0,pfx+"Title",OBJPROP\_ANCHOR,ANCHOR\_CENTER);
+// status labels
+int y=60;
+string names\[4] = {"Bleed","Hedges","Comm","LinkOK"};
+for(int i=0;i<4;i++)
+{
+ObjectCreate(0,pfx+names\[i]+"\_Lbl",OBJ\_LABEL,0,0,0);
+ObjectSetInteger(0,pfx+names\[i]+"\_Lbl",OBJPROP\_XDISTANCE,30);
+ObjectSetInteger(0,pfx+names\[i]+"\_Lbl",OBJPROP\_YDISTANCE,y+20*i);
+ObjectSetString(0,pfx+names\[i]+"\_Lbl",OBJPROP\_TEXT,names\[i]+":");
+}
+// values placeholders
+for(int i=0;i<4;i++)
+{
+ObjectCreate(0,pfx+names\[i]+"\_Val",OBJ\_LABEL,0,0,0);
+ObjectSetInteger(0,pfx+names\[i]+"\_Val",OBJPROP\_XDISTANCE,150);
+ObjectSetInteger(0,pfx+names\[i]+"\_Val",OBJPROP\_YDISTANCE,y+20*i);
+ObjectSetString(0,pfx+names\[i]+"\_Val",OBJPROP\_TEXT,"-");
+}
+}
+
+//+------------------------------------------------------------------+
+//| Update dashboard fields                                         |
+//+------------------------------------------------------------------+
+void UpdateDashboard()
+{
+string pfx="PropEA\_Hedge\_";
+// Bleed status
+ObjectSetString(0,pfx+"Bleed\_Val",OBJPROP\_TEXT, bleedDone?"Yes":"No");
+// Active hedge count
+int cnt=0; double vol=0;
+for(int i=0;i\<PositionsTotal();i++)
+{
+ulong t=PositionGetTicket(i);
+if(PositionSelectByTicket(t) && PositionGetInteger(POSITION\_MAGIC)==Magic\_Number)
+{
+cnt++; vol+=PositionGetDouble(POSITION\_VOLUME);
+}
+}
+ObjectSetString(0,pfx+"Hedges\_Val",OBJPROP\_TEXT,IntegerToString(cnt)+"/"+DoubleToString(vol,2));
+// Comm method
+string cm=(CommunicationMethod==GLOBAL\_VARS?"GVars":"File");
+ObjectSetString(0,pfx+"Comm\_Val",OBJPROP\_TEXT,cm);
+// Link OK if signalTime updated
+ObjectSetString(0,pfx+"LinkOK\_Val",OBJPROP\_TEXT,(lastSignalTime>0?"OK":"No"));
+}
+
+//+------------------------------------------------------------------+
+//| Remove all dashboard objects                                     |
+//+------------------------------------------------------------------+
+void DeleteDashboard()
+{
+ObjectsDeleteAll(0,"PropEA\_Hedge\_");
+}
+
+//+------------------------------------------------------------------+
+//| Poll for new signals                                              |
+//+------------------------------------------------------------------+
+void CheckForHedgeSignals()
+{
+datetime sigTime=0;
+if(CommunicationMethod==GLOBAL\_VARS)
+{
+string keyTime = "EASignal\_Time\_"+IntegerToString(SourceEA\_Magic);
+if(GlobalVariableCheck(keyTime)) sigTime = (datetime)GlobalVariableGet(keyTime);
+}
+else
+{
+string fn="EURUSD\_Synergy\_Signals.txt";
+if(FileIsExist(fn))
+{
+int h=FileOpen(fn,FILE\_READ|FILE\_TXT);
+if(h!=INVALID\_HANDLE)
+{
+string content=FileReadString(h);
+FileClose(h);
+FileDelete(fn);
+// parse
+string parts\[];
+int n=StringSplit(content,',',parts);
+if(n>=6) sigTime = (datetime)StringToInteger(parts\[5]);
+}
+}
+}
+if(sigTime>0 && sigTime!=lastSignalTime)
+{
+lastSignalTime = sigTime;
+// read details
+ulong typeCode=0,dirCode=0;
+double vol=0,sl=0,tp=0;
+if(CommunicationMethod==GLOBAL\_VARS)
+{
+typeCode = (ulong)GlobalVariableGet("EASignal\_Type\_"+IntegerToString(SourceEA\_Magic));
+dirCode  = (ulong)GlobalVariableGet("EASignal\_Direction\_"+IntegerToString(SourceEA\_Magic));
+vol      = GlobalVariableGet("EASignal\_Volume\_"+IntegerToString(SourceEA\_Magic));
+sl       = GlobalVariableGet("EASignal\_SL\_"+IntegerToString(SourceEA\_Magic));
+tp       = GlobalVariableGet("EASignal\_TP\_"+IntegerToString(SourceEA\_Magic));
+}
+else
+{
+// reuse parts parsed above
+string cont;
+int fh = FileOpen("EURUSD\_Synergy\_Signals.txt",FILE\_READ|FILE\_TXT);
+cont = FileReadString(fh);
+FileClose(fh);
+string p\[]; StringSplit(cont,',',p);
+typeCode = HashString(p\[0]);
+dirCode  = HashString(p\[1]);
+vol       = StringToDouble(p\[2]);
+tp        = StringToDouble(p\[3]);
+sl        = StringToDouble(p\[4]);
+}
+// decode
+string sig="",dir="";
+if(typeCode==HashString("OPEN")) sig="OPEN";
+if(typeCode==HashString("MODIFY")) sig="MODIFY";
+if(typeCode==HashString("PARTIAL\_CLOSE")) sig="PARTIAL\_CLOSE";
+if(typeCode==HashString("BLEED")) sig="BLEED";
+if(dirCode==HashString("BUY")) dir="BUY";
+if(dirCode==HashString("SELL")) dir="SELL";
+if(sig!="" && dir!="") ProcessSignal(sig,dir,vol,tp,sl);
+}
+}
+
+//+------------------------------------------------------------------+
+//| Execute a parsed signal                                          |
+//+------------------------------------------------------------------+
+void ProcessSignal(string signalType, string direction, double volume, double tp, double sl)
+{
+volume = MathMax(volume, MinimumLot);
+if(signalType=="OPEN")
+{
+if(direction=="BUY")  trade.Buy(volume,\_Symbol,0,sl,tp,"Hedge");
+else if(direction=="SELL") trade.Sell(volume,\_Symbol,0,sl,tp,"Hedge");
+Print("Hedge OPEN ",direction," vol=",volume);
+}
+else if(signalType=="MODIFY")
+{
+for(int i=0;i\<PositionsTotal();i++)
+{
+ulong t=PositionGetTicket(i);
+if(PositionSelectByTicket(t) && PositionGetInteger(POSITION\_MAGIC)==Magic\_Number)
+{
+trade.PositionModify(t, sl, tp);
+Print("Hedge MODIFY SL=",sl," TP=",tp);
+break;
+}
+}
+}
+else if(signalType=="PARTIAL\_CLOSE" || (signalType=="BLEED" && EnableBleedFeature))
+{
+for(int i=0;i\<PositionsTotal();i++)
+{
+ulong t=PositionGetTicket(i);
+if(PositionSelectByTicket(t) && PositionGetInteger(POSITION\_MAGIC)==Magic\_Number)
+{
+trade.PositionClosePartial(t, volume);
+Print("Hedge " , signalType, " vol=",volume);
+if(signalType=="BLEED") bleedDone=true;
+break;
+}
+}
+}
+}
+
+//+------------------------------------------------------------------+
+//| Monitor & log existing hedges                                    |
+//+------------------------------------------------------------------+
+void ManageHedgePositions()
+{
+// ... currently just logs count every minute
+static datetime last=0;
+if(TimeCurrent()-last<60) return;
+int cnt=0; double vol=0;
+for(int i=0;i\<PositionsTotal();i++)
+{
+ulong t=PositionGetTicket(i);
+if(PositionSelectByTicket(t) && PositionGetInteger(POSITION\_MAGIC)==Magic\_Number)
+{
+cnt++; vol+=PositionGetDouble(POSITION\_VOLUME);
+}
+}
+if(cnt>0) Print("Hedge positions: ",cnt," total vol=",DoubleToString(vol,2));
+last=TimeCurrent();
+}
