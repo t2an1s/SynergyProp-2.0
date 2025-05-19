@@ -99,6 +99,8 @@ input double    dailyDD = 1700;                        // Daily Drawdown Limit
 input int       HedgeEA_Magic = 789123;                // Hedge EA Magic Number
 input bool      InputEnableHedgeCommunication = true; // Enable Hedge Communication (read-only)
 bool EnableHedgeCommunication;  // Will be set in OnInit
+// Path of the shared signal file when using FILE_BASED communication
+string SignalFilePath;
 input ENUM_COMMUNICATION_METHOD CommunicationMethod = GLOBAL_VARS; // Hedge Communication Method
 input int       CurrentPhase = 1;                      // Current Challenge Phase (1 or 2)
 
@@ -279,6 +281,10 @@ int OnInit()
 
    // Set this at the very beginning of OnInit
    EnableHedgeCommunication = InputEnableHedgeCommunication;
+
+   // Prepare shared signal file path for file-based communication
+   SignalFilePath = TerminalInfoString(TERMINAL_COMMONDATA_PATH) + "\\Synergy_Signals.txt";
+   Print("Signal file path: ", SignalFilePath);
    
    // Set trade parameters
    trade.SetExpertMagicNumber(Magic_Number);
@@ -365,8 +371,7 @@ int OnInit()
       else
       {
          // Test file creation for file-based communication
-         string fileName = "Synergy_Signals.txt";
-         int fileHandle = FileOpen(fileName, FILE_WRITE|FILE_TXT);
+         int fileHandle = FileOpen(SignalFilePath, FILE_WRITE|FILE_TXT|FILE_COMMON);
 
          if(fileHandle != INVALID_HANDLE)
          {
@@ -1948,8 +1953,7 @@ void SendHedgeSignal(string signalType, string direction, double volume, double 
    else
    {
       // Use file-based communication
-      string fileName = "Synergy_Signals.txt";
-      int fileHandle = FileOpen(fileName, FILE_WRITE|FILE_TXT);
+      int fileHandle = FileOpen(SignalFilePath, FILE_WRITE|FILE_TXT|FILE_COMMON);
       
       if(fileHandle != INVALID_HANDLE)
       {
