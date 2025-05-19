@@ -68,19 +68,20 @@ ulong StringGetTickCount(string text)
 //────────────────────────────────────────────────────────────────────
 void SendHeartbeat()
 {
+   // We should identify ourselves with our own Magic_Number
    string name = "HEDGE_HB_" + IntegerToString(Magic_Number);
-   GlobalVariableSet(name,(double)TimeCurrent());
+   GlobalVariableSet(name, (double)TimeCurrent());
    lastPulseSent = (ulong)TimeCurrent();
 }
 
 bool IsLinkAlive()
 {
+   // We should look for the main EA's heartbeat using SourceEA_Magic
    string peer = "PROP_HB_" + IntegerToString(SourceEA_Magic);
    if(!GlobalVariableCheck(peer)) return false;
    double ts = GlobalVariableGet(peer);
    return ((TimeCurrent() - (datetime)ts) <= LINK_TIMEOUT_SEC);
 }
-
 //────────────────────────────────────────────────────────────────────
 // 5. INIT / DEINIT
 //────────────────────────────────────────────────────────────────────
@@ -173,7 +174,7 @@ void CheckForHedgeSignals()
    }
    else // FILE_BASED
    {
-      string file="EURUSD_Synergy_Signals.txt";
+      string file="Synergy_Signals.txt";
       if(!FileIsExist(file)) return;
       int h=FileOpen(file,FILE_READ|FILE_TXT); if(h==INVALID_HANDLE) return;
       string content=FileReadString(h); FileClose(h); FileDelete(file);
