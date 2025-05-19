@@ -1,5 +1,3 @@
-i have updated the main EA, compiled with no errors. please update the script for the hedge account - below - and revert with the revised, full code. use canvas.
-
 //+------------------------------------------------------------------+
 //|                                                 PropEA\_HDG.mq5 |
 //+------------------------------------------------------------------+
@@ -495,12 +493,11 @@ ObjectSetInteger(0, prefix+"PosLabel", OBJPROP\_YDISTANCE, 160);
 ObjectSetString(0, prefix+"PosLabel", OBJPROP\_TEXT, "Active Hedges:");
 ObjectSetInteger(0, prefix+"PosLabel", OBJPROP\_COLOR, clrWhite);
 
-```
-  ObjectCreate(0, prefix+"PosValue", OBJ_LABEL, 0, 0, 0);
-  ObjectSetInteger(0, prefix+"PosValue", OBJPROP_XDISTANCE, 150);
-  ObjectSetInteger(0, prefix+"PosValue", OBJPROP_YDISTANCE, 160);
-  ObjectSetInteger(0, prefix+"PosValue", OBJPROP_COLOR, clrLimeGreen);
-```
+ObjectCreate(0, prefix+"PosValue", OBJ_LABEL, 0, 0, 0);
+ObjectSetInteger(0, prefix+"PosValue", OBJPROP_XDISTANCE, 150);
+ObjectSetInteger(0, prefix+"PosValue", OBJPROP_YDISTANCE, 160);
+ObjectSetInteger(0, prefix+"PosValue", OBJPROP_COLOR, clrLimeGreen);
+
 
 }
 
