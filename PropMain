@@ -98,7 +98,7 @@ input double    SlipBufD = 0.10;                       // Slippage Buffer
 input double    dailyDD = 1700;                        // Daily Drawdown Limit
 input int       HedgeEA_Magic = 789123;                // Hedge EA Magic Number
 input bool      InputEnableHedgeCommunication = true; // Enable Hedge Communication (read-only)
-bool             EnableHedgeCommunication = false;    // ← actual, mutable flag
+bool EnableHedgeCommunication;  // Will be set in OnInit
 input ENUM_COMMUNICATION_METHOD CommunicationMethod = GLOBAL_VARS; // Hedge Communication Method
 input int       CurrentPhase = 1;                      // Current Challenge Phase (1 or 2)
 
@@ -222,19 +222,54 @@ bool adxTrendCondition;
 // Prop EA sends “PROP_HB_{magic}”; hedge EA sends “HEDGE_HB_{magic}”
 void SendHeartbeat(bool isPropSide)
 {
-   string name = (isPropSide ? "PROP_HB_"  : "HEDGE_HB_") + IntegerToString(Magic_Number);
-   GlobalVariableSet(name, (double)TimeCurrent());
+   if(!EnableHedgeCommunication) return;
+   
+   // For the main EA, create a variable that the hedge EA will look for
+   string name = "PROP_HB_" + IntegerToString(Magic_Number);
+   double currentTime = (double)TimeCurrent();
+   GlobalVariableSet(name, currentTime);
    lastPulseSent = (ulong)TimeCurrent();
+   
+   // Periodically print debug info (once every minute)
+   static datetime lastPrintTime = 0;
+   if(TimeCurrent() - lastPrintTime > 60) {
+      Print("Main EA heartbeat sent: ", name, " = ", TimeToString((datetime)currentTime));
+      lastPrintTime = TimeCurrent();
+   }
 }
 
 //  ── check if opposite side is alive
 bool IsLinkAlive(bool isPropSide)
 {
-   string peer = (isPropSide ? "HEDGE_HB_" : "PROP_HB_") + IntegerToString(Magic_Number);
-   if(!GlobalVariableCheck(peer)) return false;
+   if(!EnableHedgeCommunication) return false;
+   
+   // Main EA checks for hedge EA's heartbeat
+   string peer = "HEDGE_HB_" + IntegerToString(HedgeEA_Magic);
+   
+   if(!GlobalVariableCheck(peer)) {
+      static datetime lastErrorTime = 0;
+      if(TimeCurrent() - lastErrorTime > 60) {
+         Print("ERROR: Hedge heartbeat not found: ", peer);
+         lastErrorTime = TimeCurrent();
+      }
+      return false;
+   }
+   
    double ts = GlobalVariableGet(peer);
-   return (TimeCurrent() - (datetime)ts) <= LINK_TIMEOUT_SEC;
+   bool isAlive = (TimeCurrent() - (datetime)ts) <= LINK_TIMEOUT_SEC;
+   
+   // Log periodic status
+   static datetime lastStatusTime = 0;
+   if(TimeCurrent() - lastStatusTime > 60) {
+      Print("Hedge link status: ", isAlive ? "ALIVE" : "DEAD", 
+            " (Last beat: ", TimeToString((datetime)ts), 
+            ", Age: ", TimeCurrent() - (datetime)ts, "s)");
+      lastStatusTime = TimeCurrent();
+   }
+   
+   return isAlive;
 }
+
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                    |
@@ -242,11 +277,11 @@ bool IsLinkAlive(bool isPropSide)
 int OnInit()
 {
 
+   // Set this at the very beginning of OnInit
+   EnableHedgeCommunication = InputEnableHedgeCommunication;
+   
    // Set trade parameters
    trade.SetExpertMagicNumber(Magic_Number);
-   
-   //--- initialize runtime flag from the input
-   EnableHedgeCommunication = InputEnableHedgeCommunication;
 
    // Strategy Tester Mode
    if(MQLInfoInteger(MQL_TESTER) || TestingMode)
@@ -295,11 +330,17 @@ int OnInit()
    ArraySetAsSeries(Close, true);
    ArraySetAsSeries(TimeSeries, true);
 
-// Compute dynamic history requirement
-BARS_REQUIRED = MathMax(PivotTPBars + PivotLengthLeft + PivotLengthRight + 5, 100);
-Print("History warm-up requirement set to ",BARS_REQUIRED," bars");   
-   // Create dashboard
+   // Compute dynamic history requirement
+   BARS_REQUIRED = MathMax(PivotTPBars + PivotLengthLeft + PivotLengthRight + 5, 100);
+      Print("History warm-up requirement set to ",BARS_REQUIRED," bars");   
+   
+   // Create dashboard 
    CreateDashboard();
+   
+   // at the tail end of OnInit()
+   EventSetTimer(HEARTBEAT_SEC);          // start the timer that drives the heartbeat
+   SendHeartbeat(true);                   // first ping (true = prop side; hedge EA uses false)
+   linkWasOK = IsLinkAlive(true);
    
    // Initialize scale-out tracking variables
    scaleOut1LongTriggered = false;
@@ -311,14 +352,32 @@ Print("History warm-up requirement set to ",BARS_REQUIRED," bars");
    entryTriggersEnabled = UseSynergyScore || UseMarketBias;
    
    // Check if hedge communication is possible
-   if(EnableHedgeCommunication)
+if(EnableHedgeCommunication)
    {
-      // Register global variables for hedge communication
-      if(CommunicationMethod == GLOBAL_VARS)
-      {
-         GlobalVariableSet("EASignal_Connected_"+IntegerToString(HedgeEA_Magic), (double)TimeCurrent());
-         Print("Hedge communication enabled (Global Variables). Target EA Magic: ", HedgeEA_Magic);
-      }
+      // Initialize the global variables for the hedge EA to find
+      GlobalVariableSet("PROP_HB_" + IntegerToString(Magic_Number), (double)TimeCurrent());
+      GlobalVariableSet("EASignal_Connected_"+IntegerToString(HedgeEA_Magic), (double)TimeCurrent());
+      Print("Main EA registered heartbeat with Magic: ", Magic_Number);
+      Print("Main EA looking for hedge with Magic: ", HedgeEA_Magic);
+   }
+   
+   EventSetTimer(HEARTBEAT_SEC);
+   SendHeartbeat(true);
+   linkWasOK = IsLinkAlive(true);
+   
+   // Add diagnostic output of all global variables 
+   Print("--- GLOBAL VARIABLES AT INIT ---");
+   for(int i=0; i<GlobalVariablesTotal(); i++) {
+      string name = GlobalVariableName(i);
+      double value = GlobalVariableGet(name);
+      Print(name, " = ", value);
+   }
+   Print("-------------------------------");
+   
+   return(INIT_SUCCEEDED);
+}
+
+      
       else
       {
          // Test file creation for file-based communication
@@ -335,17 +394,22 @@ Print("History warm-up requirement set to ",BARS_REQUIRED," bars");
          {
             Print("Failed to initialize file-based communication. Error: ", GetLastError());
             return(INIT_FAILED);
+            Print("SETTINGS VERIFICATION:");
+   Print("UseFixedLot = ", UseFixedLot ? "TRUE" : "FALSE");
+   Print("FixedLotSize = ", FixedLotSize);
+   Print("RiskPercent = ", RiskPercent);
+   Print("MinLot = ", MinLot);
+   Print("Magic_Number = ", Magic_Number);
+   Print("HedgeEA_Magic = ", HedgeEA_Magic);
+   Print("EnableHedgeCommunication = ", EnableHedgeCommunication ? "TRUE" : "FALSE");
+   Print("Synergy Strategy v1.01 initialised. Hedge factor:",DoubleToString(hedgeFactor,4));
+   return(INIT_SUCCEEDED);
+   
          }
       }
    }
    
-   Print("Synergy Strategy v1.01 initialised. Hedge factor:",DoubleToString(hedgeFactor,4));
-   return(INIT_SUCCEEDED);
    
-   // at the tail end of OnInit()
-EventSetTimer(HEARTBEAT_SEC);          // start the timer that drives the heartbeat
-SendHeartbeat(true);                   // first ping (true = prop side; hedge EA uses false)
-linkWasOK = IsLinkAlive(true);
 }
 
 //+------------------------------------------------------------------+
@@ -424,24 +488,6 @@ void OnTick()
    CheckBleedCondition();
 }
 
-//--------------------------------------------------------------------
-// 4.  HELPER EnterTrade()  (wrapper to declutter OnTick)            
-//--------------------------------------------------------------------
-void EnterTrade(bool isLong,double sl,double tp)
-{
-   double slPips = MathAbs(Close[0]-sl)/GetPipSize();
-   double raw    = UseFixedLot?FixedLotSize:CalculatePositionSize(slPips, RiskPercent);
-   double lots   = NormalizeLots(raw);
-   double hLots  = NormalizeLots(lots*hedgeFactor);
-   lastEntryLots = lots; hedgeLotsLast=hLots;
-   bool ok = isLong? trade.Buy(lots,_Symbol,0,sl,tp,"Long") : trade.Sell(lots,_Symbol,0,sl,tp,"Short");
-   if(!ok){ Print("Entry failed: ",GetLastError()); return; }
-   if(isLong){ scaleOut1LongTriggered=false; beAppliedLong=false; }
-   else      { scaleOut1ShortTriggered=false; beAppliedShort=false; }
-   if(EnableHedgeCommunication)
-      SendHedgeSignal("OPEN", isLong?"SELL":"BUY", hLots, tp, sl);
-}
-
 //+------------------------------------------------------------------+
 //| Expert deinitialization function                                 |
 //+------------------------------------------------------------------+
@@ -488,9 +534,22 @@ void OnTimer()
    if(ok != linkWasOK)              // state changed → print once
    {
       Print("Hedge link is now ", ok ? "OK ✅" : "NOT OK ❌");
+      
+      // When link fails, print global variables for diagnostic
+      if(!ok) {
+         Print("--- GLOBAL VARIABLES WHEN LINK FAILED ---");
+         for(int i=0; i<GlobalVariablesTotal(); i++) {
+            string name = GlobalVariableName(i);
+            double value = GlobalVariableGet(name);
+            Print(name, " = ", value);
+         }
+         Print("-------------------------------");
+      }
+      
       linkWasOK = ok;
    }
 }
+
 
 //+------------------------------------------------------------------+
 //| Draw Pivot Lines on Chart                                        |
@@ -876,36 +935,51 @@ void ManageOpenPositions()
 //+------------------------------------------------------------------+
 //| Generic order opener (replaces the long / short duplication)     |
 //+------------------------------------------------------------------+
-void OpenTrade(bool isLong,const double sl,const double tp)
+void OpenTrade(bool isLong, const double sl, const double tp)
 {
    //––– lot-size
-   double slPips   = MathAbs(Close[0]-sl) / GetPipSize();
-   double rawLots  = UseFixedLot ? FixedLotSize
-                                 : CalculatePositionSize(slPips,RiskPercent);
-   double lots     = NormalizeLots(rawLots);
+   double slPips = MathAbs(Close[0]-sl) / GetPipSize();
+   
+   Print("OpenTrade: UseFixedLot=", UseFixedLot, ", FixedLotSize=", FixedLotSize, ", RiskPercent=", RiskPercent);
+   
+   double rawLots;
+   if(UseFixedLot) {
+      rawLots = FixedLotSize;
+      Print("Using fixed lot size: ", FixedLotSize);
+   } else {
+      rawLots = CalculatePositionSize(slPips, RiskPercent);
+      Print("Using risk-based lot size: ", rawLots, " (SL pips: ", slPips, ", Risk%: ", RiskPercent, ")");
+   }
+   
+   double lots = NormalizeLots(rawLots);
+   Print("Final normalized lot size: ", lots);
 
    //––– hedge volume
-   double lotLive  = NormalizeLots(lots * hedgeFactor);
+   double lotLive = NormalizeLots(lots * hedgeFactor);
 
    // record for later
-   lastEntryLots  = lots;
-   hedgeLotsLast  = lotLive;
+   lastEntryLots = lots;
+   hedgeLotsLast = lotLive;
 
    //––– place main order
-   bool ok =  isLong
-              ? trade.Buy (lots,_Symbol,0,sl,tp,"Long")
-              : trade.Sell(lots,_Symbol,0,sl,tp,"Short");
+   bool ok = isLong
+             ? trade.Buy(lots, _Symbol, 0, sl, tp, "Long")
+             : trade.Sell(lots, _Symbol, 0, sl, tp, "Short");
 
-   if(!ok){ Print("OpenTrade(): order failed – ",GetLastError()); return; }
+   if(!ok) { 
+      Print("OpenTrade(): order failed – ", GetLastError());
+      return;
+   }
 
    // reset per-side flags
-   if(isLong){ scaleOut1LongTriggered=false; beAppliedLong =false; }
-   else       { scaleOut1ShortTriggered=false; beAppliedShort=false; }
+   if(isLong) { scaleOut1LongTriggered = false; beAppliedLong = false; }
+   else { scaleOut1ShortTriggered = false; beAppliedShort = false; }
 
    //––– fire hedge order
    if(EnableHedgeCommunication)
       SendHedgeSignal("OPEN", isLong? "SELL":"BUY", lotLive, tp, sl);
 }
+
 
 //+------------------------------------------------------------------+
 //| One-liner wrapper for bleed logic                                |
@@ -1733,16 +1807,46 @@ bool HasOpenPosition()
 //+------------------------------------------------------------------+
 double CalculatePositionSize(double slPips, double riskPercent)
 {
+   // Add validation and logging
+   if(slPips <= 0) {
+      Print("ERROR: Invalid stop loss distance of ", slPips, " pips. Using minimum lot.");
+      return MinLot;
+   }
+   
    double accountBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
    double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
    
+   // Calculate risk amount based on percentage
    double riskAmount = accountBalance * riskPercent / 100;
-   double pipValue = tickValue * (GetPipSize() / tickSize);
    
+   // Calculate pip value with validation
+   double pipValue = 0;
+   if(tickSize > 0) {
+      pipValue = tickValue * (GetPipSize() / tickSize);
+   } else {
+      Print("ERROR: Tick size is zero. Using minimum lot.");
+      return MinLot;
+   }
+   
+   if(pipValue <= 0) {
+      Print("ERROR: Invalid pip value. Using minimum lot.");
+      return MinLot;
+   }
+   
+   // Calculate lot size with validation
    double lotSize = riskAmount / (slPips * pipValue);
    
-   return MathMin(lotSize, accountBalance * 0.1); // Max 10% of balance
+   // Log the calculation for debugging
+   Print("Risk calculation: Balance=", accountBalance, 
+         ", Risk%=", riskPercent, 
+         ", SL pips=", slPips, 
+         ", Pip value=", pipValue,
+         ", Risk amount=", riskAmount, 
+         ", Calculated lot=", lotSize);
+   
+   // Apply maximum risk limit (10% of balance)
+   return MathMax(MinLot, MathMin(lotSize, accountBalance * 0.1));
 }
 
 //+------------------------------------------------------------------+
@@ -1832,12 +1936,17 @@ void SendHedgeSignal(string signalType, string direction, double volume, double 
    if(CommunicationMethod == GLOBAL_VARS)
    {
       // Use global variables for communication
-      GlobalVariableSet("EASignal_Type_"+IntegerToString(HedgeEA_Magic), (double)StringGetTickCount(signalType));
-      GlobalVariableSet("EASignal_Direction_"+IntegerToString(HedgeEA_Magic), (double)StringGetTickCount(direction));
-      GlobalVariableSet("EASignal_Volume_"+IntegerToString(HedgeEA_Magic), volume);
-      GlobalVariableSet("EASignal_SL_"+IntegerToString(HedgeEA_Magic), sl);
-      GlobalVariableSet("EASignal_TP_"+IntegerToString(HedgeEA_Magic), tp);
-      GlobalVariableSet("EASignal_Time_"+IntegerToString(HedgeEA_Magic), (double)TimeCurrent());
+      string magicStr = IntegerToString(HedgeEA_Magic);
+      GlobalVariableSet("EASignal_Type_" + magicStr, (double)StringGetTickCount(signalType));
+      GlobalVariableSet("EASignal_Direction_" + magicStr, (double)StringGetTickCount(direction));
+      GlobalVariableSet("EASignal_Volume_" + magicStr, volume);
+      GlobalVariableSet("EASignal_SL_" + magicStr, sl);
+      GlobalVariableSet("EASignal_TP_" + magicStr, tp);
+      GlobalVariableSet("EASignal_Time_" + magicStr, (double)TimeCurrent());
+      
+      Print("Signal sent to hedge EA: ", signalType, " ", direction, " ", 
+            DoubleToString(volume, 2), " lots, TP: ", DoubleToString(tp, 5), 
+            ", SL: ", DoubleToString(sl, 5));
    }
    else
    {
