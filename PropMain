@@ -655,32 +655,8 @@ void OnDeinit(const int reason)
       GlobalVariableDel("EASignal_Direction_"+IntegerToString(HedgeEA_Magic));
       GlobalVariableDel("EASignal_Volume_"+IntegerToString(HedgeEA_Magic));
       GlobalVariableDel("EASignal_SL_"+IntegerToString(HedgeEA_Magic));
-   GlobalVariableDel("EASignal_TP_"+IntegerToString(HedgeEA_Magic));
-   GlobalVariableDel("EASignal_Time_"+IntegerToString(HedgeEA_Magic));
-  }
-
-   // Remove temporary files when using file communication
-   if(EnableHedgeCommunication && CommunicationMethod == FILE_BASED)
-   {
-      string commonPath   = TerminalInfoString(TERMINAL_COMMONDATA_PATH) + "\\MQL5\\Files";
-      string heartbeatFile = commonPath + "\\MT5com_heartbeat.txt";
-      string signalFile    = commonPath + "\\MT5com.txt";
-
-      int fh = FileOpen(heartbeatFile, FILE_READ|FILE_TXT);
-      if(fh != INVALID_HANDLE)
-      {
-         FileClose(fh);
-         if(FileDelete(heartbeatFile))
-            Print("Deleted heartbeat file: ", heartbeatFile);
-      }
-
-      fh = FileOpen(signalFile, FILE_READ|FILE_TXT);
-      if(fh != INVALID_HANDLE)
-      {
-         FileClose(fh);
-         if(FileDelete(signalFile))
-            Print("Deleted signal file: ", signalFile);
-      }
+      GlobalVariableDel("EASignal_TP_"+IntegerToString(HedgeEA_Magic));
+      GlobalVariableDel("EASignal_Time_"+IntegerToString(HedgeEA_Magic));
    }
    
    Print("Synergy Strategy stopped. Reason: ", GetUninitReasonText(reason));
