@@ -737,51 +737,97 @@ void OnTimer()
 //+------------------------------------------------------------------+
 void DrawPivotLines()
 {
-   // Delete existing lines first
+   // Delete existing zig-zag segments and SL/TP markers first
    ObjectsDeleteAll(0, "PivotLine_");
-   
+   ObjectsDeleteAll(0, "SLTPLine_");
+
    if(!ShowPivotLines) return;
-   
-   // Get current pivot levels
-   double stopLossLong = FindDeepestPivotLowBelowClose(PivotTPBars);
-   double takeProfitLong = FindHighestPivotHighAboveClose(PivotTPBars);
-   double stopLossShort = FindHighestPivotHighAboveClose(PivotTPBars);
-   double takeProfitShort = FindDeepestPivotLowBelowClose(PivotTPBars);
-   
-   // Draw Stop Loss Long
-   if(stopLossLong > 0) {
-      ObjectCreate(0, "PivotLine_SL_Long", OBJ_HLINE, 0, 0, stopLossLong);
-      ObjectSetInteger(0, "PivotLine_SL_Long", OBJPROP_COLOR, clrRed);
-      ObjectSetInteger(0, "PivotLine_SL_Long", OBJPROP_STYLE, STYLE_DASH);
-      ObjectSetInteger(0, "PivotLine_SL_Long", OBJPROP_WIDTH, 1);
-      ObjectSetString(0, "PivotLine_SL_Long", OBJPROP_TEXT, "SL Long");
+
+   // Build arrays of pivot points within the lookback window
+   double pivotPrices[];
+   datetime pivotTimes[];
+
+   int total = ArraySize(Low);
+   if(total==0) return;
+
+   int maxLook = MathMin(PivotTPBars, total-PivotLengthRight-1);
+
+   for(int i=maxLook; i>=PivotLengthRight; i--)
+   {
+      bool isLow=true;
+      for(int l=1;l<=PivotLengthLeft && isLow;l++)
+         if(i+l<total && Low[i+l]<=Low[i]) isLow=false;
+      for(int r=1;r<=PivotLengthRight && isLow;r++)
+         if(i-r>=0 && Low[i-r]<=Low[i]) isLow=false;
+      if(isLow)
+      {
+         int sz=ArraySize(pivotPrices);
+         ArrayResize(pivotPrices,sz+1);
+         ArrayResize(pivotTimes ,sz+1);
+         pivotPrices[sz]=Low[i];
+         pivotTimes[sz]=TimeSeries[i];
+      }
+
+      bool isHigh=true;
+      for(int l=1;l<=PivotLengthLeft && isHigh;l++)
+         if(i+l<total && High[i+l]>=High[i]) isHigh=false;
+      for(int r=1;r<=PivotLengthRight && isHigh;r++)
+         if(i-r>=0 && High[i-r]>=High[i]) isHigh=false;
+      if(isHigh)
+      {
+         int sz=ArraySize(pivotPrices);
+         ArrayResize(pivotPrices,sz+1);
+         ArrayResize(pivotTimes ,sz+1);
+         pivotPrices[sz]=High[i];
+         pivotTimes[sz]=TimeSeries[i];
+      }
    }
-   
-   // Draw Take Profit Long
-   if(takeProfitLong > 0) {
-      ObjectCreate(0, "PivotLine_TP_Long", OBJ_HLINE, 0, 0, takeProfitLong);
-      ObjectSetInteger(0, "PivotLine_TP_Long", OBJPROP_COLOR, clrGreen);
-      ObjectSetInteger(0, "PivotLine_TP_Long", OBJPROP_STYLE, STYLE_DASH);
-      ObjectSetInteger(0, "PivotLine_TP_Long", OBJPROP_WIDTH, 1);
-      ObjectSetString(0, "PivotLine_TP_Long", OBJPROP_TEXT, "TP Long");
+
+   // Draw zig-zag by connecting consecutive pivot points
+   for(int i=1;i<ArraySize(pivotPrices);i++)
+   {
+      string name="PivotLine_"+IntegerToString(i);
+      ObjectCreate(0,name,OBJ_TREND,0,
+                   pivotTimes[i-1],pivotPrices[i-1],
+                   pivotTimes[i],pivotPrices[i]);
+      ObjectSetInteger(0,name,OBJPROP_COLOR,clrOrange);
+      ObjectSetInteger(0,name,OBJPROP_WIDTH,1);
    }
-   
-   // Draw Stop Loss Short
-   if(stopLossShort > 0) {
-      ObjectCreate(0, "PivotLine_SL_Short", OBJ_HLINE, 0, 0, stopLossShort);
-      ObjectSetInteger(0, "PivotLine_SL_Short", OBJPROP_COLOR, clrRed);
-      ObjectSetInteger(0, "PivotLine_SL_Short", OBJPROP_STYLE, STYLE_DOT);
-      ObjectSetInteger(0, "PivotLine_SL_Short", OBJPROP_WIDTH, 1);
-      ObjectSetString(0, "PivotLine_SL_Short", OBJPROP_TEXT, "SL Short");
+
+   //––– draw current SL/TP levels as short trend lines
+   int lineBars = MathMin(20, PivotTPBars);
+   datetime t1  = TimeSeries[0] - lineBars*PeriodSeconds();
+   datetime t2  = TimeSeries[0] + lineBars*PeriodSeconds();
+
+   if(pivotStopLongEntry>0)
+   {
+      string n="SLTPLine_SL_Long";
+      ObjectCreate(0,n,OBJ_TREND,0,t1,pivotStopLongEntry,t2,pivotStopLongEntry);
+      ObjectSetInteger(0,n,OBJPROP_COLOR,clrRed);
+      ObjectSetInteger(0,n,OBJPROP_WIDTH,2);
    }
-   
-   // Draw Take Profit Short
-   if(takeProfitShort > 0) {
-      ObjectCreate(0, "PivotLine_TP_Short", OBJ_HLINE, 0, 0, takeProfitShort);
-      ObjectSetInteger(0, "PivotLine_TP_Short", OBJPROP_COLOR, clrGreen);
-      ObjectSetInteger(0, "PivotLine_TP_Short", OBJPROP_STYLE, STYLE_DOT);
-      ObjectSetInteger(0, "PivotLine_TP_Short", OBJPROP_WIDTH, 1);
-      ObjectSetString(0, "PivotLine_TP_Short", OBJPROP_TEXT, "TP Short");
+   if(pivotTpLongEntry>0)
+   {
+      string n="SLTPLine_TP_Long";
+      ObjectCreate(0,n,OBJ_TREND,0,t1,pivotTpLongEntry,t2,pivotTpLongEntry);
+      ObjectSetInteger(0,n,OBJPROP_COLOR,clrGreen);
+      ObjectSetInteger(0,n,OBJPROP_WIDTH,2);
+   }
+   if(pivotStopShortEntry>0)
+   {
+      string n="SLTPLine_SL_Short";
+      ObjectCreate(0,n,OBJ_TREND,0,t1,pivotStopShortEntry,t2,pivotStopShortEntry);
+      ObjectSetInteger(0,n,OBJPROP_COLOR,clrRed);
+      ObjectSetInteger(0,n,OBJPROP_STYLE,STYLE_DOT);
+      ObjectSetInteger(0,n,OBJPROP_WIDTH,2);
+   }
+   if(pivotTpShortEntry>0)
+   {
+      string n="SLTPLine_TP_Short";
+      ObjectCreate(0,n,OBJ_TREND,0,t1,pivotTpShortEntry,t2,pivotTpShortEntry);
+      ObjectSetInteger(0,n,OBJPROP_COLOR,clrGreen);
+      ObjectSetInteger(0,n,OBJPROP_STYLE,STYLE_DOT);
+      ObjectSetInteger(0,n,OBJPROP_WIDTH,2);
    }
 }
 
@@ -1118,8 +1164,12 @@ void ManageOpenPositions()
 //+------------------------------------------------------------------+
 void OpenTrade(bool isLong, const double sl, const double tp)
 {
+   double slAdj = sl;
+   double tpAdj = tp;
+   EnsureValidStops(isLong, slAdj, tpAdj);
+
    //––– lot-size
-   double slPips = MathAbs(Close[0]-sl) / GetPipSize();
+   double slPips = MathAbs(Close[0]-slAdj) / GetPipSize();
    
    Print("OpenTrade: UseFixedLot=", UseFixedLot, ", FixedLotSize=", FixedLotSize, ", RiskPercent=", RiskPercent);
    
@@ -1144,8 +1194,8 @@ void OpenTrade(bool isLong, const double sl, const double tp)
 
    //––– place main order
    bool ok = isLong
-             ? trade.Buy(lots, _Symbol, 0, sl, tp, "Long")
-             : trade.Sell(lots, _Symbol, 0, sl, tp, "Short");
+             ? trade.Buy(lots, _Symbol, 0, slAdj, tpAdj, "Long")
+             : trade.Sell(lots, _Symbol, 0, slAdj, tpAdj, "Short");
 
    if(!ok) { 
       Print("OpenTrade(): order failed – ", GetLastError());
@@ -1158,7 +1208,7 @@ void OpenTrade(bool isLong, const double sl, const double tp)
 
    //––– fire hedge order
    if(EnableHedgeCommunication)
-      SendHedgeSignal("OPEN", isLong? "SELL":"BUY", lotLive, tp, sl);
+      SendHedgeSignal("OPEN", isLong? "SELL":"BUY", lotLive, tpAdj, slAdj);
 }
 
 
@@ -2059,6 +2109,31 @@ double NormalizeLots(double lots)
    lots = MathRound(lots / lotStep) * lotStep;
    
    return lots;
+}
+
+//+------------------------------------------------------------------+
+//| Ensure SL and TP comply with minimum stop distance                |
+//+------------------------------------------------------------------+
+void EnsureValidStops(bool isLong,double &sl,double &tp)
+{
+   double stopPts = SymbolInfoInteger(_Symbol,SYMBOL_TRADE_STOPS_LEVEL);
+   double minDist = stopPts*_Point;
+   double price   = isLong ? SymbolInfoDouble(_Symbol,SYMBOL_ASK)
+                           : SymbolInfoDouble(_Symbol,SYMBOL_BID);
+
+   if(isLong)
+   {
+      if(sl<=0 || price-sl<minDist) sl=price-minDist;
+      if(tp<=0 || tp-price<minDist) tp=price+minDist;
+   }
+   else
+   {
+      if(sl<=0 || sl-price<minDist) sl=price+minDist;
+      if(tp<=0 || price-tp<minDist) tp=price-minDist;
+   }
+
+   sl=NormalizeDouble(sl,_Digits);
+   tp=NormalizeDouble(tp,_Digits);
 }
 
 //+------------------------------------------------------------------+
