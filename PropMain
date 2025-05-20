@@ -8,7 +8,9 @@
 //|   • Re‑implemented pivot‑scan functions with bounds checks       |
 //|   • Safe CopyBuffer calls with early return on incomplete data   |
 //|   • Hardened CalculateEMAValue & CalculateADXFilter              |
+        codex/fix-manual-trade-not-triggering-hedge-logic
 //|   • Added manual trade handler (OnTradeTransaction)              |
+//|   • Manual trades trigger hedge via OnTradeTransaction           |
 //+------------------------------------------------------------------+
 #property copyright "t2an1s"
 #property link      "http://www.yourwebsite.com"
@@ -336,12 +338,20 @@ bool IsLinkAlive(bool isPropSide)
       string content = FileReadString(fileHandle);
       FileClose(fileHandle);
       
-      // Debug: Print what we read from file
-      Print("DEBUG: Read from hedge file: ", content);
-      
       // Parse heartbeat data: format is HEDGE_HEARTBEAT,magicnumber,timestamp
       string parts[];
       int count = StringSplit(content, ',', parts);
+      
+      // Check format validity (removed frequent debug message)
+      if(count < 3 || parts[0] != "HEDGE_HEARTBEAT")
+      {
+         static datetime lastFormatError = 0;
+         if(TimeCurrent() - lastFormatError > 60) {  // Only log format errors once per minute
+            Print("ERROR: Invalid hedge heartbeat format: ", content);
+            lastFormatError = TimeCurrent();
+         }
+         return false;
+      }
       
       // Check if magic number matches
       if(parts[1] != IntegerToString(HedgeEA_Magic))
@@ -540,7 +550,7 @@ int OnInit()
    Print("HedgeEA_Magic = ", HedgeEA_Magic);
    Print("EnableHedgeCommunication = ", EnableHedgeCommunication ? "TRUE" : "FALSE");
    Print("CommunicationMethod = ", CommunicationMethod == GLOBAL_VARS ? "GLOBAL_VARS" : "FILE_BASED");
-   Print("Synergy Strategy v1.01 initialised. Hedge factor:",DoubleToString(hedgeFactor,4));
+   Print("Synergy Strategy v1.02 initialised. Hedge factor:",DoubleToString(hedgeFactor,4));
 
    return(INIT_SUCCEEDED);
 }
@@ -666,9 +676,15 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    if(trans.symbol!=_Symbol)                  return;
 
    // Ignore EA managed positions
+
    if(trans.order_magic==Magic_Number) return;
 
    if(trans.entry==DEAL_ENTRY_IN)
+
+   if(trans.magic==Magic_Number) return;
+
+   if(trans.deal_entry==DEAL_ENTRY_IN)
+
    {
       bool isLong = (trans.deal_type==DEAL_TYPE_BUY);
 
@@ -676,9 +692,15 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
       hedgeLotsLast  = NormalizeLots(lastEntryLots*hedgeFactor);
 
       SendHedgeSignal("OPEN", isLong?"SELL":"BUY", hedgeLotsLast,
+
                       trans.tp, trans.sl);
    }
    else if(trans.entry==DEAL_ENTRY_OUT)
+
+                      trans.price_tp, trans.price_sl);
+   }
+   else if(trans.deal_entry==DEAL_ENTRY_OUT)
+
    {
       bool closingLong  = (trans.deal_type==DEAL_TYPE_SELL);
       double vol        = NormalizeLots(trans.volume*hedgeFactor);
@@ -2126,11 +2148,13 @@ void SendHedgeSignal(string signalType, string direction, double volume, double 
                         IntegerToString(Magic_Number) + "," +
                         IntegerToString(TimeCurrent());
       
+      Print("SENDING SIGNAL: ", signalData);  // Debug signal transmission
+      
       // Try to write the signal file with retries
       bool success = false;
       for(int attempt = 1; attempt <= FILE_WRITE_RETRY && !success; attempt++)
       {
-         int fileHandle = FileOpen(COMM_FILE_PATH, FILE_WRITE|FILE_COMMON);
+         int fileHandle = FileOpen(COMM_FILE_PATH, FILE_WRITE|FILE_TXT|FILE_COMMON);
          if(fileHandle != INVALID_HANDLE)
          {
             FileWriteString(fileHandle, signalData);
