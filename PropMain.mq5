@@ -42,7 +42,8 @@ bool   scaleOut1LongTriggered = false;
 bool   scaleOut1ShortTriggered = false;
 bool   beAppliedLong = false;
 bool   beAppliedShort = false;
-bool   entryTriggersEnabled = true;
+// Master trigger – need at least one filter active
+bool   entryTriggersEnabled = false;
 bool   inSession            = true;
 // ── Hedge-link monitor ─────────────────────────────────────────────
 const int    HEARTBEAT_SEC    = 5;          // how often we publish our pulse
@@ -505,8 +506,13 @@ int OnInit()
    beAppliedLong = false;
    beAppliedShort = false;
    
+
+   // Master trigger – enable if Synergy or Bias filter active
+   entryTriggersEnabled = UseSynergyScore || UseMarketBias;
+
    // Enable entry triggers regardless of optional filters
    entryTriggersEnabled = true;
+
 
    // Set up hedge communication if enabled
    if(EnableHedgeCommunication)
