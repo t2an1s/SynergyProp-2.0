@@ -2580,16 +2580,4 @@ string GetUninitReasonText(int reason)
       default:                 return "Unknown reason: " + IntegerToString(reason);
    }
 }
-
-//+------------------------------------------------------------------+
-//| Get tick count from a string (hash function)                      |
-//+------------------------------------------------------------------+
-ulong StringGetTickCount(string text)
-{
-   ulong result = 0;
-   for(int i = 0; i < StringLen(text); i++)
-   {
-      result += (ulong)StringGetCharacter(text, i);
-   }
-   return result;
-}
+   
