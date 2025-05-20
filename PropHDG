@@ -350,7 +350,8 @@ void OnDeinit(const int reason)
       // Use absolute path for cleanup
       string commonPath = TerminalInfoString(TERMINAL_COMMONDATA_PATH) + "\\MQL5\\Files";
       string heartbeatFile = commonPath + "\\MT5com_hedge_heartbeat.txt";
-      
+      string signalFile    = commonPath + "\\MT5com.txt";
+
       // Check if file exists using direct path
       int fileHandle = FileOpen(heartbeatFile, FILE_READ|FILE_TXT);
       if(fileHandle != INVALID_HANDLE) {
@@ -358,7 +359,17 @@ void OnDeinit(const int reason)
          if(FileDelete(heartbeatFile)) {
             Print("Deleted hedge heartbeat file: ", heartbeatFile);
          } else {
-            Print("Failed to delete heartbeat file: ", GetLastError());
+            Print("Failed to delete hedge heartbeat file: ", GetLastError());
+         }
+      }
+
+      fileHandle = FileOpen(signalFile, FILE_READ|FILE_TXT);
+      if(fileHandle != INVALID_HANDLE) {
+         FileClose(fileHandle);
+         if(FileDelete(signalFile)) {
+            Print("Deleted signal file: ", signalFile);
+         } else {
+            Print("Failed to delete signal file: ", GetLastError());
          }
       }
    }
