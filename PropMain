@@ -335,12 +335,20 @@ bool IsLinkAlive(bool isPropSide)
       string content = FileReadString(fileHandle);
       FileClose(fileHandle);
       
-      // Debug: Print what we read from file
-      Print("DEBUG: Read from hedge file: ", content);
-      
       // Parse heartbeat data: format is HEDGE_HEARTBEAT,magicnumber,timestamp
       string parts[];
       int count = StringSplit(content, ',', parts);
+      
+      // Check format validity (removed frequent debug message)
+      if(count < 3 || parts[0] != "HEDGE_HEARTBEAT")
+      {
+         static datetime lastFormatError = 0;
+         if(TimeCurrent() - lastFormatError > 60) {  // Only log format errors once per minute
+            Print("ERROR: Invalid hedge heartbeat format: ", content);
+            lastFormatError = TimeCurrent();
+         }
+         return false;
+      }
       
       // Check if magic number matches
       if(parts[1] != IntegerToString(HedgeEA_Magic))
@@ -651,39 +659,6 @@ void OnDeinit(const int reason)
    }
    
    Print("Synergy Strategy stopped. Reason: ", GetUninitReasonText(reason));
-}
-
-//+------------------------------------------------------------------+
-//| Trade transaction handler - reacts to manual trades               |
-//+------------------------------------------------------------------+
-void OnTradeTransaction(const MqlTradeTransaction &trans,
-                        const MqlTradeRequest    &request,
-                        const MqlTradeResult     &result)
-{
-   if(!EnableHedgeCommunication)              return;
-   if(trans.type!=TRADE_TRANSACTION_DEAL_ADD) return;
-   if(trans.symbol!=_Symbol)                  return;
-
-   // Ignore EA managed positions
-   if(trans.magic==Magic_Number) return;
-
-   if(trans.deal_entry==DEAL_ENTRY_IN)
-   {
-      bool isLong = (trans.deal_type==DEAL_TYPE_BUY);
-
-      lastEntryLots  = trans.volume;
-      hedgeLotsLast  = NormalizeLots(lastEntryLots*hedgeFactor);
-
-      SendHedgeSignal("OPEN", isLong?"SELL":"BUY", hedgeLotsLast,
-                      trans.price_tp, trans.price_sl);
-   }
-   else if(trans.deal_entry==DEAL_ENTRY_OUT)
-   {
-      bool closingLong  = (trans.deal_type==DEAL_TYPE_SELL);
-      double vol        = NormalizeLots(trans.volume*hedgeFactor);
-
-      SendHedgeSignal("PARTIAL_CLOSE", closingLong?"SELL":"BUY", vol, 0, 0);
-   }
 }
 
 //+------------------------------------------------------------------+
@@ -1972,47 +1947,45 @@ bool HasOpenPosition()
 //+------------------------------------------------------------------+
 double CalculatePositionSize(double slPips, double riskPercent)
 {
-   // Validate stop distance
-   if(slPips <= 0)
-   {
+   // Add validation and logging
+   if(slPips <= 0) {
       Print("ERROR: Invalid stop loss distance of ", slPips, " pips. Using minimum lot.");
       return MinLot;
    }
-
-   double accountBalance  = AccountInfoDouble(ACCOUNT_BALANCE);
-   double tickValue       = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-   double tickSize        = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-
-   // Risk amount in account currency
-   double riskAmount = accountBalance * (riskPercent * 0.01);
-
-   // Pip value of one lot
+   
+   double accountBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   
+   // Calculate risk amount based on percentage
+   double riskAmount = accountBalance * riskPercent / 100;
+   
+   // Calculate pip value with validation
    double pipValue = 0;
-   if(tickSize > 0)
+   if(tickSize > 0) {
       pipValue = tickValue * (GetPipSize() / tickSize);
-   else
-   {
+   } else {
       Print("ERROR: Tick size is zero. Using minimum lot.");
       return MinLot;
    }
-
-   if(pipValue <= 0)
-   {
+   
+   if(pipValue <= 0) {
       Print("ERROR: Invalid pip value. Using minimum lot.");
       return MinLot;
    }
-
-   // Calculate raw lot size
+   
+   // Calculate lot size with validation
    double lotSize = riskAmount / (slPips * pipValue);
-
-   Print("Risk calculation: Balance=", accountBalance,
-         ", Risk%=", riskPercent,
-         ", SL pips=", slPips,
+   
+   // Log the calculation for debugging
+   Print("Risk calculation: Balance=", accountBalance, 
+         ", Risk%=", riskPercent, 
+         ", SL pips=", slPips, 
          ", Pip value=", pipValue,
-         ", Risk amount=", riskAmount,
+         ", Risk amount=", riskAmount, 
          ", Calculated lot=", lotSize);
-
-   // Constrain final lot size to broker limits and 10 % of balance
+   
+   // Apply maximum risk limit (10% of balance)
    return MathMax(MinLot, MathMin(lotSize, accountBalance * 0.1));
 }
 
@@ -2127,11 +2100,13 @@ void SendHedgeSignal(string signalType, string direction, double volume, double 
                         IntegerToString(Magic_Number) + "," +
                         IntegerToString(TimeCurrent());
       
+      Print("SENDING SIGNAL: ", signalData);  // Debug signal transmission
+      
       // Try to write the signal file with retries
       bool success = false;
       for(int attempt = 1; attempt <= FILE_WRITE_RETRY && !success; attempt++)
       {
-         int fileHandle = FileOpen(COMM_FILE_PATH, FILE_WRITE|FILE_COMMON);
+         int fileHandle = FileOpen(COMM_FILE_PATH, FILE_WRITE|FILE_TXT|FILE_COMMON);
          if(fileHandle != INVALID_HANDLE)
          {
             FileWriteString(fileHandle, signalData);
