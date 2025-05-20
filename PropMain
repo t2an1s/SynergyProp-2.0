@@ -1939,45 +1939,47 @@ bool HasOpenPosition()
 //+------------------------------------------------------------------+
 double CalculatePositionSize(double slPips, double riskPercent)
 {
-   // Add validation and logging
-   if(slPips <= 0) {
+   // Validate stop distance
+   if(slPips <= 0)
+   {
       Print("ERROR: Invalid stop loss distance of ", slPips, " pips. Using minimum lot.");
       return MinLot;
    }
-   
-   double accountBalance = AccountInfoDouble(ACCOUNT_BALANCE);
-   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-   
-   // Calculate risk amount based on percentage
-   double riskAmount = accountBalance * riskPercent / 100;
-   
-   // Calculate pip value with validation
+
+   double accountBalance  = AccountInfoDouble(ACCOUNT_BALANCE);
+   double tickValue       = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize        = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+
+   // Risk amount in account currency
+   double riskAmount = accountBalance * (riskPercent * 0.01);
+
+   // Pip value of one lot
    double pipValue = 0;
-   if(tickSize > 0) {
+   if(tickSize > 0)
       pipValue = tickValue * (GetPipSize() / tickSize);
-   } else {
+   else
+   {
       Print("ERROR: Tick size is zero. Using minimum lot.");
       return MinLot;
    }
-   
-   if(pipValue <= 0) {
+
+   if(pipValue <= 0)
+   {
       Print("ERROR: Invalid pip value. Using minimum lot.");
       return MinLot;
    }
-   
-   // Calculate lot size with validation
+
+   // Calculate raw lot size
    double lotSize = riskAmount / (slPips * pipValue);
-   
-   // Log the calculation for debugging
-   Print("Risk calculation: Balance=", accountBalance, 
-         ", Risk%=", riskPercent, 
-         ", SL pips=", slPips, 
+
+   Print("Risk calculation: Balance=", accountBalance,
+         ", Risk%=", riskPercent,
+         ", SL pips=", slPips,
          ", Pip value=", pipValue,
-         ", Risk amount=", riskAmount, 
+         ", Risk amount=", riskAmount,
          ", Calculated lot=", lotSize);
-   
-   // Apply maximum risk limit (10% of balance)
+
+   // Constrain final lot size to broker limits and 10 % of balance
    return MathMax(MinLot, MathMin(lotSize, accountBalance * 0.1));
 }
 
