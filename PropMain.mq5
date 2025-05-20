@@ -2303,7 +2303,17 @@ bool IsNewBar()
 // used by IsConfirmedBar()
 bool IsConfirmedBar()
 {
-   return  ( TimeCurrent() - TimeSeries[0] ) >= PeriodSeconds();
+   // Ensure we reference the *previous* bar so it is fully closed when
+   // this function is called on the first tick of a new bar. Using index 0
+   // prevented any confirmation because TimeSeries[0] is the current bar
+   // start time. As a result the EA always detected an unconfirmed bar and
+   // skipped trading. We now check TimeSeries[1] which represents the last
+   // completed bar.
+   if(ArraySize(TimeSeries) < 2)
+      return false;
+
+   datetime prevBarTime = TimeSeries[1];
+   return (TimeCurrent() - prevBarTime) >= PeriodSeconds();
 }
 //+------------------------------------------------------------------+
 //| Check if market is open                                          |

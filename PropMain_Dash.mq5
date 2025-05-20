@@ -2286,7 +2286,15 @@ bool IsNewBar()
 // used by IsConfirmedBar()
 bool IsConfirmedBar()
 {
-   return  ( TimeCurrent() - TimeSeries[0] ) >= PeriodSeconds();
+   // Use the previous bar's timestamp to verify that a bar has fully
+   // completed. The earlier implementation referenced the current bar
+   // which caused `IsConfirmedBar()` to remain false at the new bar's
+   // first tick, effectively blocking entries.
+   if(ArraySize(TimeSeries) < 2)
+      return false;
+
+   datetime prevBarTime = TimeSeries[1];
+   return (TimeCurrent() - prevBarTime) >= PeriodSeconds();
 }
 //+------------------------------------------------------------------+
 //| Check if market is open                                          |
