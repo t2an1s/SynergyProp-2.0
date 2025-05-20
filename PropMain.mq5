@@ -506,8 +506,13 @@ int OnInit()
    beAppliedLong = false;
    beAppliedShort = false;
    
+
    // Master trigger – enable if Synergy or Bias filter active
    entryTriggersEnabled = UseSynergyScore || UseMarketBias;
+
+   // Enable entry triggers regardless of optional filters
+   entryTriggersEnabled = true;
+
 
    // Set up hedge communication if enabled
    if(EnableHedgeCommunication)
