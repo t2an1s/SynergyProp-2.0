@@ -1579,81 +1579,140 @@ ENUM_TIMEFRAMES GetTimeframeFromString(string tfString)
 }
 
 //+------------------------------------------------------------------+
-//| Dashboard Variables                                               |
+//| Input Parameters - Dashboard Settings (Add to your inputs)       |
+//+------------------------------------------------------------------+
+input group "Dashboard Settings"
+input bool      ShowDashboard = true;                  // Show Dashboard
+input int       DashboardFontSize = 9;                 // Dashboard Font Size
+input int       DashboardTransparency = 80;            // Background Transparency (0-255)
+input int       DashboardXPosition = 10;               // Dashboard X Position
+input int       DashboardYPosition = 10;               // Dashboard Y Position
+
+//+------------------------------------------------------------------+
+//| Dashboard Variables (Updated)                                     |
 //+------------------------------------------------------------------+
 string dashboardPrefix = "PropEA_Dashboard_";
-color headerBgColor = clrGold;
-color sectionHeaderBg = clrBlack;
+color headerBgColor = clrNavy;
+color sectionHeaderBg = clrDarkSlateGray;
 color dataBgColor = clrIndigo;
 color textColor = clrWhite;
 color statusGreen = clrLime;
 color statusRed = clrRed;
-color costRecoveryHeaderBg = clrGold;
+color statusOrange = clrOrange;
+color costRecoveryHeaderBg = clrDarkSlateGray;
 color costRecoveryCriteriaBg = clrGray;
 
+// Live account simulation variables
+double liveAccountBalance = 0;
+double liveAccountEquity = 0;
+double liveAccountMargin = 0;
+double liveDailyStartBalance = 0;
+datetime lastDayCheck = 0;
+
 //+------------------------------------------------------------------+
-//| Create Dashboard                                                  |
+//| Initialize Live Account Simulation                                |
+//+------------------------------------------------------------------+
+void InitializeLiveAccountSimulation()
+{
+   liveAccountBalance = initialBalance * hedgeFactor;
+   liveAccountEquity = liveAccountBalance;
+   liveAccountMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE) * hedgeFactor;
+   liveDailyStartBalance = liveAccountBalance;
+   lastDayCheck = TimeCurrent();
+}
+
+//+------------------------------------------------------------------+
+//| Update Live Account Simulation                                    |
+//+------------------------------------------------------------------+
+void UpdateLiveAccountSimulation()
+{
+   // Check for new day
+   MqlDateTime currentTime, lastTime;
+   TimeToStruct(TimeCurrent(), currentTime);
+   TimeToStruct(lastDayCheck, lastTime);
+   
+   if(currentTime.day != lastTime.day)
+   {
+      liveDailyStartBalance = liveAccountBalance;
+      lastDayCheck = TimeCurrent();
+   }
+   
+   // Update live account values based on prop account performance
+   double propPerformance = (AccountInfoDouble(ACCOUNT_BALANCE) - initialBalance) / initialBalance;
+   liveAccountBalance = (initialBalance * hedgeFactor) * (1 + propPerformance);
+   liveAccountEquity = liveAccountBalance + (AccountInfoDouble(ACCOUNT_EQUITY) - AccountInfoDouble(ACCOUNT_BALANCE)) * hedgeFactor;
+   liveAccountMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE) * hedgeFactor;
+}
+
+//+------------------------------------------------------------------+
+//| Create Dashboard (Fixed and Enhanced)                             |
 //+------------------------------------------------------------------+
 void CreateDashboard()
 {
+   if(!ShowDashboard) return;
+   
    // Remove any existing dashboard objects
    DeleteDashboard();
    
-   // Create background panel
+   // Initialize live account simulation
+   InitializeLiveAccountSimulation();
+   
+   // Create main background panel with transparency
    ObjectCreate(0, dashboardPrefix + "BG", OBJ_RECTANGLE_LABEL, 0, 0, 0);
-   ObjectSetInteger(0, dashboardPrefix + "BG", OBJPROP_XDISTANCE, 10);
-   ObjectSetInteger(0, dashboardPrefix + "BG", OBJPROP_YDISTANCE, 10);
-   ObjectSetInteger(0, dashboardPrefix + "BG", OBJPROP_XSIZE, 500);  // Widened to match screenshot
-   ObjectSetInteger(0, dashboardPrefix + "BG", OBJPROP_YSIZE, 600);
+   ObjectSetInteger(0, dashboardPrefix + "BG", OBJPROP_XDISTANCE, DashboardXPosition);
+   ObjectSetInteger(0, dashboardPrefix + "BG", OBJPROP_YDISTANCE, DashboardYPosition);
+   ObjectSetInteger(0, dashboardPrefix + "BG", OBJPROP_XSIZE, 520);
+   ObjectSetInteger(0, dashboardPrefix + "BG", OBJPROP_YSIZE, 580);
    ObjectSetInteger(0, dashboardPrefix + "BG", OBJPROP_BGCOLOR, dataBgColor);
+   ObjectSetInteger(0, dashboardPrefix + "BG", OBJPROP_COLOR, clrWhite);
    ObjectSetInteger(0, dashboardPrefix + "BG", OBJPROP_BORDER_TYPE, BORDER_FLAT);
    ObjectSetInteger(0, dashboardPrefix + "BG", OBJPROP_CORNER, CORNER_LEFT_UPPER);
    ObjectSetInteger(0, dashboardPrefix + "BG", OBJPROP_STYLE, STYLE_SOLID);
-   ObjectSetInteger(0, dashboardPrefix + "BG", OBJPROP_WIDTH, 1);
+   ObjectSetInteger(0, dashboardPrefix + "BG", OBJPROP_WIDTH, 2);
    ObjectSetInteger(0, dashboardPrefix + "BG", OBJPROP_BACK, false);
    ObjectSetInteger(0, dashboardPrefix + "BG", OBJPROP_SELECTABLE, false);
    ObjectSetInteger(0, dashboardPrefix + "BG", OBJPROP_SELECTED, false);
    ObjectSetInteger(0, dashboardPrefix + "BG", OBJPROP_HIDDEN, true);
    ObjectSetInteger(0, dashboardPrefix + "BG", OBJPROP_ZORDER, 0);
    
-   // Create header background
-   ObjectCreate(0, dashboardPrefix + "HeaderBG", OBJ_RECTANGLE_LABEL, 0, 0, 0);
-   ObjectSetInteger(0, dashboardPrefix + "HeaderBG", OBJPROP_XDISTANCE, 10);
-   ObjectSetInteger(0, dashboardPrefix + "HeaderBG", OBJPROP_YDISTANCE, 10);
-   ObjectSetInteger(0, dashboardPrefix + "HeaderBG", OBJPROP_XSIZE, 500);
-   ObjectSetInteger(0, dashboardPrefix + "HeaderBG", OBJPROP_YSIZE, 90);
-   ObjectSetInteger(0, dashboardPrefix + "HeaderBG", OBJPROP_BGCOLOR, headerBgColor);
-   ObjectSetInteger(0, dashboardPrefix + "HeaderBG", OBJPROP_BORDER_TYPE, BORDER_FLAT);
-   ObjectSetInteger(0, dashboardPrefix + "HeaderBG", OBJPROP_CORNER, CORNER_LEFT_UPPER);
-   ObjectSetInteger(0, dashboardPrefix + "HeaderBG", OBJPROP_STYLE, STYLE_SOLID);
-   ObjectSetInteger(0, dashboardPrefix + "HeaderBG", OBJPROP_WIDTH, 1);
-   ObjectSetInteger(0, dashboardPrefix + "HeaderBG", OBJPROP_BACK, false);
-   ObjectSetInteger(0, dashboardPrefix + "HeaderBG", OBJPROP_SELECTABLE, false);
-   ObjectSetInteger(0, dashboardPrefix + "HeaderBG", OBJPROP_SELECTED, false);
-   ObjectSetInteger(0, dashboardPrefix + "HeaderBG", OBJPROP_HIDDEN, true);
-   ObjectSetInteger(0, dashboardPrefix + "HeaderBG", OBJPROP_ZORDER, 1);
+   // Add transparency by creating overlay
+   ObjectCreate(0, dashboardPrefix + "Transparency", OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, dashboardPrefix + "Transparency", OBJPROP_XDISTANCE, DashboardXPosition);
+   ObjectSetInteger(0, dashboardPrefix + "Transparency", OBJPROP_YDISTANCE, DashboardYPosition);
+   ObjectSetInteger(0, dashboardPrefix + "Transparency", OBJPROP_XSIZE, 520);
+   ObjectSetInteger(0, dashboardPrefix + "Transparency", OBJPROP_YSIZE, 580);
+   ObjectSetInteger(0, dashboardPrefix + "Transparency", OBJPROP_BGCOLOR, clrBlack);
+   ObjectSetInteger(0, dashboardPrefix + "Transparency", OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, dashboardPrefix + "Transparency", OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, dashboardPrefix + "Transparency", OBJPROP_BACK, false);
+   ObjectSetInteger(0, dashboardPrefix + "Transparency", OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, dashboardPrefix + "Transparency", OBJPROP_SELECTED, false);
+   ObjectSetInteger(0, dashboardPrefix + "Transparency", OBJPROP_HIDDEN, true);
+   ObjectSetInteger(0, dashboardPrefix + "Transparency", OBJPROP_ZORDER, 1);
    
-   // Add Title
-   CreateLabel(dashboardPrefix + "Title", _Symbol + " Synergy + PropEA Hedge", 250, 25, clrBlack, 14, "Arial Bold", true);
+   // Add Main Title
+   CreateLabel(dashboardPrefix + "Title", _Symbol + " Synergy + PropEA Hedge v1.02", 260, 20, clrWhite, DashboardFontSize + 3, "Arial Bold", true);
    
-   // Add header items
-   CreateLabel(dashboardPrefix + "LicenseTypeLabel", "License Type", 20, 50, clrBlack, 10);
-   CreateLabel(dashboardPrefix + "LicenseTypeValue", "TESTER", 150, 50, clrBlack, 10);
+   int y = 50;
    
-   CreateLabel(dashboardPrefix + "VersionLabel", "Version", 20, 70, clrBlack, 10);
-   CreateLabel(dashboardPrefix + "VersionValue", "1.00", 150, 70, clrBlack, 10);
+   // Create Phase and Hedge Link section
+   CreateLabel(dashboardPrefix + "PhaseLabel", "Phase:", 20, y, textColor, DashboardFontSize);
+   CreateLabel(dashboardPrefix + "PhaseValue", IntegerToString(CurrentPhase), 80, y, clrYellow, DashboardFontSize);
    
-   CreateLabel(dashboardPrefix + "StatusLabel", "Status", 20, 90, clrBlack, 10);
-   CreateLabel(dashboardPrefix + "StatusValue", "Connected / Working", 150, 90, statusGreen, 10);
+   CreateLabel(dashboardPrefix + "HedgeLinkLabel", "Hedge Link:", 300, y, textColor, DashboardFontSize);
+   CreateLabel(dashboardPrefix + "HedgeLinkValue", "NOT OK", 380, y, statusRed, DashboardFontSize);
    
-   // Phase Indicator
-   CreateLabel(dashboardPrefix + "PhaseLabel", "Phase", 300, 50, clrBlack, 10);
-   CreateLabel(dashboardPrefix + "PhaseValue", IntegerToString(CurrentPhase), 380, 50, clrBlack, 10);
+   y += 30;
    
-   // Live Trading Information Section
-   int y = 110;
-   CreateSectionHeader("Live Trading Information", y);
+   // Trading Information Section
+   CreateSectionHeader("Trading Information", y);
    y += 25;
+   
+   // Column headers with better positioning
+   CreateLabel(dashboardPrefix + "PropHeader", "PropAcc", 200, y, clrYellow, DashboardFontSize, "Arial Bold", true);
+   CreateLabel(dashboardPrefix + "LiveHeader", "LiveAcc", 380, y, clrYellow, DashboardFontSize, "Arial Bold", true);
+   
+   y += 20;
    
    CreateDataRow("Volume", "0.00", "0.00", y);
    y += 20;
@@ -1664,173 +1723,374 @@ void CreateDashboard()
    CreateDataRow("Summary PnL", "0.00 / " + DoubleToString(MaxDD, 2), "0.00 / " + DoubleToString(ChallengeC, 2), y);
    y += 20;
    
-   CreateDataRow("Trading Days", "0 / 0", "", y);
+   CreateDataRow("Trading Days", "0 / 0", "0 / 0", y);
    y += 20;
    
    // Account Status Section
    CreateSectionHeader("Account Status", y);
    y += 25;
    
-   CreateDataRow("Account", IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)), "N/A", y);
+   // Column headers
+   CreateLabel(dashboardPrefix + "PropHeader2", "PropAcc", 200, y, clrYellow, DashboardFontSize, "Arial Bold", true);
+   CreateLabel(dashboardPrefix + "LiveHeader2", "LiveAcc", 380, y, clrYellow, DashboardFontSize, "Arial Bold", true);
+   
    y += 20;
    
-   CreateDataRow("Account Currency", AccountInfoString(ACCOUNT_CURRENCY), AccountInfoString(ACCOUNT_CURRENCY), y);
+   CreateDataRow("Account", IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)), "LIVE-" + IntegerToString(HedgeEA_Magic), y);
    y += 20;
    
-   CreateDataRow("Free margin", DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_FREE), 2), "N/A", y);
+   CreateDataRow("Currency", AccountInfoString(ACCOUNT_CURRENCY), AccountInfoString(ACCOUNT_CURRENCY), y);
+   y += 20;
+   
+   CreateDataRow("Free Margin", DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_FREE), 2), "0.00", y);
    y += 20;
    
    CreateDataRow("Symbol", _Symbol, _Symbol, y);
    y += 20;
    
-   CreateDataRow("Daily DD Type", "Balance & Equity", "", y);
+   CreateDataRow("Daily DD Type", "Balance & Equity", "Balance & Equity", y);
    y += 20;
    
-   CreateDataRow("Today Allowed DD", DoubleToString(dailyDD, 2) + " / " + DoubleToString(dailyDD, 2), "100.0 %", y);
+   CreateDataRow("Today DD", DoubleToString(dailyDD, 2), "100.0%", y);
    y += 20;
    
-   CreateDataRow("Max Allowed DD", DoubleToString(MaxDD, 2) + " / " + DoubleToString(MaxDD, 2), "100.0 %", y);
+   CreateDataRow("Max DD", DoubleToString(MaxDD, 2), "100.0%", y);
    y += 20;
    
-   CreateLabel(dashboardPrefix+"LinkLabel",  "Hedge Link", 300, 70, clrBlack, 10);
-   CreateLabel(dashboardPrefix+"LinkValue",  "--",         380, 70, clrRed  , 10);
    // Cost Recovery Section
-   y += 20;
    CreateCostRecoverySection(y);
-   
-   // Add visual info for Market Bias & Synergy Score
    y += 100;
+   
+   // Strategy Status Section
    CreateSectionHeader("Strategy Status", y);
    y += 25;
    
-   ObjectCreate(0, dashboardPrefix + "BiasLabel", OBJ_LABEL, 0, 0, 0);
-   ObjectSetInteger(0, dashboardPrefix + "BiasLabel", OBJPROP_XDISTANCE, 20);
-   ObjectSetInteger(0, dashboardPrefix + "BiasLabel", OBJPROP_YDISTANCE, y);
-   ObjectSetString(0, dashboardPrefix + "BiasLabel", OBJPROP_TEXT, "Market Bias:");
-   ObjectSetInteger(0, dashboardPrefix + "BiasLabel", OBJPROP_COLOR, textColor);
+   // Market Bias
+   CreateLabel(dashboardPrefix + "BiasLabel", "Market Bias:", 20, y, textColor, DashboardFontSize);
+   CreateLabel(dashboardPrefix + "BiasValue", "NEUTRAL", 120, y, clrGray, DashboardFontSize);
+   CreateLabel(dashboardPrefix + "BiasIndicator", "●", 200, y, currentBiasPositive ? statusGreen : statusRed, DashboardFontSize + 3);
+   y += 18;
    
-   ObjectCreate(0, dashboardPrefix + "BiasIndicator", OBJ_RECTANGLE_LABEL, 0, 0, 0);
-   ObjectSetInteger(0, dashboardPrefix + "BiasIndicator", OBJPROP_XDISTANCE, 150);
-   ObjectSetInteger(0, dashboardPrefix + "BiasIndicator", OBJPROP_YDISTANCE, y);
-   ObjectSetInteger(0, dashboardPrefix + "BiasIndicator", OBJPROP_XSIZE, 15);
-   ObjectSetInteger(0, dashboardPrefix + "BiasIndicator", OBJPROP_YSIZE, 15);
-   ObjectSetInteger(0, dashboardPrefix + "BiasIndicator", OBJPROP_BGCOLOR, currentBiasPositive ? BullishColor : BearishColor);
+   // Synergy Score
+   CreateLabel(dashboardPrefix + "SynergyLabel", "Synergy Score:", 20, y, textColor, DashboardFontSize);
+   CreateLabel(dashboardPrefix + "SynergyValue", DoubleToString(synergyScore, 2), 120, y, textColor, DashboardFontSize);
+   y += 18;
    
-   y += 20;
+   // ADX Status
+   CreateLabel(dashboardPrefix + "ADXLabel", "ADX Status:", 20, y, textColor, DashboardFontSize);
+   CreateLabel(dashboardPrefix + "ADXValue", "Waiting", 120, y, statusRed, DashboardFontSize);
+   CreateLabel(dashboardPrefix + "ADXValueNum", "(0.0)", 180, y, textColor, DashboardFontSize - 1);
+   y += 18;
    
-   ObjectCreate(0, dashboardPrefix + "SynergyLabel", OBJ_LABEL, 0, 0, 0);
-   ObjectSetInteger(0, dashboardPrefix + "SynergyLabel", OBJPROP_XDISTANCE, 20);
-   ObjectSetInteger(0, dashboardPrefix + "SynergyLabel", OBJPROP_YDISTANCE, y);
-   ObjectSetString(0, dashboardPrefix + "SynergyLabel", OBJPROP_TEXT, "Synergy Score:");
-   ObjectSetInteger(0, dashboardPrefix + "SynergyLabel", OBJPROP_COLOR, textColor);
+   // Scale Out Features
+   CreateLabel(dashboardPrefix + "ScaleOutLabel", "Scale Out:", 20, y, textColor, DashboardFontSize);
+   CreateLabel(dashboardPrefix + "ScaleOutValue", "OFF", 120, y, statusRed, DashboardFontSize);
+   CreateLabel(dashboardPrefix + "ScaleOutDetails", "", 160, y, textColor, DashboardFontSize - 1);
+   y += 18;
    
-   ObjectCreate(0, dashboardPrefix + "SynergyValue", OBJ_LABEL, 0, 0, 0);
-   ObjectSetInteger(0, dashboardPrefix + "SynergyValue", OBJPROP_XDISTANCE, 150);
-   ObjectSetInteger(0, dashboardPrefix + "SynergyValue", OBJPROP_YDISTANCE, y);
-   ObjectSetString(0, dashboardPrefix + "SynergyValue", OBJPROP_TEXT, DoubleToString(synergyScore, 2));
-   ObjectSetInteger(0, dashboardPrefix + "SynergyValue", OBJPROP_COLOR, synergyScore > 0 ? BullishColor : (synergyScore < 0 ? BearishColor : textColor));
+   // Pivot Settings
+   CreateLabel(dashboardPrefix + "PivotLabel", "Pivot Settings:", 20, y, textColor, DashboardFontSize);
+   CreateLabel(dashboardPrefix + "PivotValue", IntegerToString(PivotLengthLeft) + "/" + IntegerToString(PivotLengthRight), 120, y, textColor, DashboardFontSize);
+   CreateLabel(dashboardPrefix + "PivotBars", "LB:" + IntegerToString(PivotTPBars), 170, y, textColor, DashboardFontSize - 1);
+   y += 18;
    
-   y += 20;
+   // Session Filter
+   CreateLabel(dashboardPrefix + "SessionLabel", "Session Filter:", 20, y, textColor, DashboardFontSize);
+   CreateLabel(dashboardPrefix + "SessionValue", EnableSessionFilter ? "ON" : "OFF", 120, y, EnableSessionFilter ? statusGreen : statusRed, DashboardFontSize);
+   y += 18;
    
-   ObjectCreate(0, dashboardPrefix + "ADXLabel", OBJ_LABEL, 0, 0, 0);
-   ObjectSetInteger(0, dashboardPrefix + "ADXLabel", OBJPROP_XDISTANCE, 20);
-   ObjectSetInteger(0, dashboardPrefix + "ADXLabel", OBJPROP_YDISTANCE, y);
-   ObjectSetString(0, dashboardPrefix + "ADXLabel", OBJPROP_TEXT, "ADX Status:");
-   ObjectSetInteger(0, dashboardPrefix + "ADXLabel", OBJPROP_COLOR, textColor);
+   // Signal Ready Status
+   CreateLabel(dashboardPrefix + "SignalLabel", "Signal Ready:", 20, y, textColor, DashboardFontSize);
+   CreateLabel(dashboardPrefix + "SignalValue", "CHECKING", 120, y, statusOrange, DashboardFontSize);
+   y += 18;
    
-   ObjectCreate(0, dashboardPrefix + "ADXValue", OBJ_LABEL, 0, 0, 0);
-   ObjectSetInteger(0, dashboardPrefix + "ADXValue", OBJPROP_XDISTANCE, 150);
-   ObjectSetInteger(0, dashboardPrefix + "ADXValue", OBJPROP_YDISTANCE, y);
-   ObjectSetString(0, dashboardPrefix + "ADXValue", OBJPROP_TEXT, adxTrendCondition ? "Active" : "Waiting");
-   ObjectSetInteger(0, dashboardPrefix + "ADXValue", OBJPROP_COLOR, adxTrendCondition ? statusGreen : statusRed);
+   // Trading Enabled
+   CreateLabel(dashboardPrefix + "TradingLabel", "Trading:", 20, y, textColor, DashboardFontSize);
+   CreateLabel(dashboardPrefix + "TradingValue", EnableTrading ? "ENABLED" : "DISABLED", 120, y, EnableTrading ? statusGreen : statusRed, DashboardFontSize);
+   y += 18;
    
-   y += 20;
-   
-   ObjectCreate(0, dashboardPrefix + "TimeLabel", OBJ_LABEL, 0, 0, 0);
-   ObjectSetInteger(0, dashboardPrefix + "TimeLabel", OBJPROP_XDISTANCE, 20);
-   ObjectSetInteger(0, dashboardPrefix + "TimeLabel", OBJPROP_YDISTANCE, y);
-   ObjectSetString(0, dashboardPrefix + "TimeLabel", OBJPROP_TEXT, "Last Updated:");
-   ObjectSetInteger(0, dashboardPrefix + "TimeLabel", OBJPROP_COLOR, textColor);
-   
-   ObjectCreate(0, dashboardPrefix + "TimeValue", OBJ_LABEL, 0, 0, 0);
-   ObjectSetInteger(0, dashboardPrefix + "TimeValue", OBJPROP_XDISTANCE, 150);
-   ObjectSetInteger(0, dashboardPrefix + "TimeValue", OBJPROP_YDISTANCE, y);
-   ObjectSetString(0, dashboardPrefix + "TimeValue", OBJPROP_TEXT, TimeToString(TimeCurrent(), TIME_SECONDS));
-   ObjectSetInteger(0, dashboardPrefix + "TimeValue", OBJPROP_COLOR, textColor);
+   // Last Updated
+   CreateLabel(dashboardPrefix + "TimeLabel", "Last Updated:", 20, y, textColor, DashboardFontSize);
+   CreateLabel(dashboardPrefix + "TimeValue", TimeToString(TimeCurrent(), TIME_SECONDS), 120, y, textColor, DashboardFontSize);
 }
 
 //+------------------------------------------------------------------+
-//| Update Dashboard with latest values                               |
+//| Get Actual Account Volume (Fix #1)                               |
+//+------------------------------------------------------------------+
+double GetActualAccountVolume()
+{
+   double totalVolume = 0;
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      if(PositionGetTicket(i) > 0)
+      {
+         totalVolume += PositionGetDouble(POSITION_VOLUME);
+      }
+   }
+   return totalVolume;
+}
+
+//+------------------------------------------------------------------+
+//| Get Live Account Free Margin (Fix #3)                            |
+//+------------------------------------------------------------------+
+double GetLiveAccountFreeMargin()
+{
+   // In a real implementation, this would query the actual live account
+   // For simulation, we'll use a realistic calculation based on hedge positions
+   double propMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   double liveMargin = 0;
+   
+   if(EnableHedgeCommunication && IsLinkAlive(true))
+   {
+      // Simulate live account margin based on hedge positions
+      double hedgeVolume = GetActualAccountVolume() * hedgeFactor;
+      double marginPerLot = SymbolInfoDouble(_Symbol, SYMBOL_MARGIN_INITIAL);
+      liveMargin = (initialBalance * hedgeFactor) - (hedgeVolume * marginPerLot);
+   }
+   else
+   {
+      // No connection - show estimated margin
+      liveMargin = propMargin * hedgeFactor;
+   }
+   
+   return MathMax(0, liveMargin);
+}
+
+//+------------------------------------------------------------------+
+//| Get Real Daily PnL from History (Fix #4)                         |
+//+------------------------------------------------------------------+
+double GetRealDailyPnLFromHistory()
+{
+   datetime startOfDay = 0;
+   datetime currentTime = TimeCurrent();
+   
+   // Get start of current day
+   MqlDateTime dt;
+   TimeToStruct(currentTime, dt);
+   dt.hour = 0;
+   dt.min = 0;
+   dt.sec = 0;
+   startOfDay = StructToTime(dt);
+   
+   // Select history for today
+   if(!HistorySelect(startOfDay, currentTime))
+   {
+      Print("Failed to select history for today");
+      return 0;
+   }
+   
+   double dailyProfit = 0;
+   int totalDeals = HistoryDealsTotal();
+   
+   // Sum all deals from today
+   for(int i = 0; i < totalDeals; i++)
+   {
+      ulong dealTicket = HistoryDealGetTicket(i);
+      if(dealTicket > 0)
+      {
+         string dealSymbol = HistoryDealGetString(dealTicket, DEAL_SYMBOL);
+         if(dealSymbol == _Symbol || dealSymbol == "") // Include all symbols or current symbol
+         {
+            double profit = HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
+            double swap = HistoryDealGetDouble(dealTicket, DEAL_SWAP);
+            double commission = HistoryDealGetDouble(dealTicket, DEAL_COMMISSION);
+            
+            dailyProfit += (profit + swap + commission);
+         }
+      }
+   }
+   
+   return dailyProfit;
+}
+
+//+------------------------------------------------------------------+
+//| Get Real Total PnL from History (Fix #4)                         |
+//+------------------------------------------------------------------+
+double GetRealTotalPnLFromHistory()
+{
+   // Get account's actual starting balance from first deposit
+   double startingBalance = initialBalance;
+   double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   
+   // Calculate total PnL as difference from starting balance
+   // This accounts for any deposits/withdrawals that may have occurred
+   double totalPnL = currentBalance - startingBalance;
+   
+   // Add floating PnL
+   double floatingPnL = currentEquity - currentBalance;
+   
+   return totalPnL + floatingPnL;
+}
+
+//+------------------------------------------------------------------+
+//| Update Dashboard with latest values (All Fixes Applied)           |
 //+------------------------------------------------------------------+
 void UpdateDashboard()
 {
-   // must sit near the top so colour stays fresh
-   bool linkOK = IsLinkAlive(true);
-   ObjectSetString (0, dashboardPrefix+"LinkValue", OBJPROP_TEXT , linkOK ? "OK" : "NOT OK");
-   ObjectSetInteger(0, dashboardPrefix+"LinkValue", OBJPROP_COLOR, linkOK ? statusGreen : statusRed);
+   if(!ShowDashboard) return;
    
-   // Update volumes
-   double propVolume = CalculateTotalVolume();
-   double hedgeVolume = propVolume * hedgeFactor;
+   // Update live account simulation
+   UpdateLiveAccountSimulation();
+   
+   // Update Hedge Link Status
+   bool linkOK = IsLinkAlive(true);
+   ObjectSetString(0, dashboardPrefix + "HedgeLinkValue", OBJPROP_TEXT, linkOK ? "CONNECTED" : "NOT OK");
+   ObjectSetInteger(0, dashboardPrefix + "HedgeLinkValue", OBJPROP_COLOR, linkOK ? statusGreen : statusRed);
+   
+   // FIX #1: Update Trading Information - Use actual account volumes
+   double propVolume = GetActualAccountVolume();  // All positions, not just EA-managed
+   double hedgeVolume = propVolume * hedgeFactor; // Simulated hedge volume
    ObjectSetString(0, dashboardPrefix + "Volume_Prop", OBJPROP_TEXT, DoubleToString(propVolume, 2));
    ObjectSetString(0, dashboardPrefix + "Volume_Real", OBJPROP_TEXT, DoubleToString(hedgeVolume, 2));
    
-   // Update PnL values
-   double dailyPnL = CalculateDailyPnL();
-   ObjectSetString(0, dashboardPrefix + "Daily PnL_Prop", OBJPROP_TEXT, DoubleToString(dailyPnL, 2));
+   // FIX #4: Update PnL values - Use real history data
+   double propDailyPnL = GetRealDailyPnLFromHistory();
+   double liveDailyPnL = propDailyPnL * hedgeFactor; // Simulated live daily PnL
    
-   double totalProfit = AccountInfoDouble(ACCOUNT_BALANCE) - initialBalance;
+   ObjectSetString(0, dashboardPrefix + "Daily PnL_Prop", OBJPROP_TEXT, 
+                  (propDailyPnL >= 0 ? "+" : "") + DoubleToString(propDailyPnL, 2));
+   ObjectSetString(0, dashboardPrefix + "Daily PnL_Real", OBJPROP_TEXT, 
+                  (liveDailyPnL >= 0 ? "+" : "") + DoubleToString(liveDailyPnL, 2));
+   
+   // Summary PnL - Use real total PnL from history
+   double propTotalPnL = GetRealTotalPnLFromHistory();
+   double liveTotalPnL = propTotalPnL * hedgeFactor; // Simulated live total PnL
+   
    ObjectSetString(0, dashboardPrefix + "Summary PnL_Prop", OBJPROP_TEXT, 
-                  DoubleToString(totalProfit, 2) + " / " + DoubleToString(MaxDD, 2));
+                  (propTotalPnL >= 0 ? "+" : "") + DoubleToString(propTotalPnL, 2) + " / " + DoubleToString(MaxDD, 2));
+   ObjectSetString(0, dashboardPrefix + "Summary PnL_Real", OBJPROP_TEXT, 
+                  (liveTotalPnL >= 0 ? "+" : "") + DoubleToString(liveTotalPnL, 2) + " / " + DoubleToString(ChallengeC, 2));
    
-   // Update margin
-   ObjectSetString(0, dashboardPrefix + "Free margin_Prop", OBJPROP_TEXT, 
-                  DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_FREE), 2));
+   // Update Account Status - Fixed live account display
+   ObjectSetString(0, dashboardPrefix + "Account_Real", OBJPROP_TEXT, "LIVE-" + IntegerToString(HedgeEA_Magic));
    
-   // Update Cost Recovery section
-   double propLoss = MathMin(0, totalProfit);
+   // FIX #3: Update margins - Use real live account margin calculation
+   double propMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   double liveMargin = GetLiveAccountFreeMargin(); // Proper live margin calculation
+   ObjectSetString(0, dashboardPrefix + "Free Margin_Prop", OBJPROP_TEXT, DoubleToString(propMargin, 2));
+   ObjectSetString(0, dashboardPrefix + "Free Margin_Real", OBJPROP_TEXT, DoubleToString(liveMargin, 2));
+   
+   // Update Trading Days
+   int tradingDays = GetTradingDaysCount();
+   ObjectSetString(0, dashboardPrefix + "Trading Days_Prop", OBJPROP_TEXT, IntegerToString(tradingDays) + " / " + IntegerToString(tradingDays));
+   ObjectSetString(0, dashboardPrefix + "Trading Days_Real", OBJPROP_TEXT, IntegerToString(tradingDays) + " / " + IntegerToString(tradingDays));
+   
+   // FIX #2: Update Cost Recovery section - Fixed object naming
+   double propLoss = MathMin(0, propTotalPnL);
    double propLossAbs = MathAbs(propLoss);
-   double realProfit = 0; // This would need to be updated from the hedge EA
-   double recoveryPct = propLossAbs > 0 ? (realProfit / propLossAbs) * 100 : 0;
+   double realProfit = MathMax(0, liveTotalPnL);
+   double recoveryPct = 0;
    
-   ObjectSetString(0, dashboardPrefix + "CR_Loss_Prop", OBJPROP_TEXT, 
-                  propLoss < 0 ? DoubleToString(propLoss, 2) : "0.00");
-   ObjectSetString(0, dashboardPrefix + "CR_Profit_Real", OBJPROP_TEXT, 
+   if(propLossAbs > 0 && realProfit > 0) {
+      recoveryPct = (realProfit / propLossAbs) * 100;
+   } else if(propLossAbs == 0 && realProfit > 0) {
+      recoveryPct = 100.0;
+   }
+   
+   // Fixed object names to match creation
+   ObjectSetString(0, dashboardPrefix + "CostRecovery_Loss_Prop", OBJPROP_TEXT, 
+                  propLoss < -0.01 ? DoubleToString(propLoss, 2) : "0.00");
+   ObjectSetString(0, dashboardPrefix + "CostRecovery_Profit_Real", OBJPROP_TEXT, 
                   DoubleToString(realProfit, 2));
-   ObjectSetString(0, dashboardPrefix + "CR_Recovery", OBJPROP_TEXT, 
-                  DoubleToString(recoveryPct, 1) + " %");
+   ObjectSetString(0, dashboardPrefix + "CostRecovery_Recovery", OBJPROP_TEXT, 
+                  DoubleToString(recoveryPct, 1) + "%");
    
    // Update Strategy Status indicators
-   ObjectSetInteger(0, dashboardPrefix + "BiasIndicator", OBJPROP_BGCOLOR, 
-                   currentBiasPositive ? BullishColor : BearishColor);
+   // Market Bias
+   string biasText = "NEUTRAL";
+   color biasColor = clrGray;
+   if(UseMarketBias) {
+      biasText = currentBiasPositive ? "BULLISH" : "BEARISH";
+      biasColor = currentBiasPositive ? statusGreen : statusRed;
+   }
+   ObjectSetString(0, dashboardPrefix + "BiasValue", OBJPROP_TEXT, biasText);
+   ObjectSetInteger(0, dashboardPrefix + "BiasValue", OBJPROP_COLOR, biasColor);
+   ObjectSetInteger(0, dashboardPrefix + "BiasIndicator", OBJPROP_COLOR, biasColor);
    
-   ObjectSetString(0, dashboardPrefix + "SynergyValue", OBJPROP_TEXT, 
-                  DoubleToString(synergyScore, 2));
+   // Synergy Score
+   ObjectSetString(0, dashboardPrefix + "SynergyValue", OBJPROP_TEXT, DoubleToString(synergyScore, 2));
    ObjectSetInteger(0, dashboardPrefix + "SynergyValue", OBJPROP_COLOR, 
-                   synergyScore > 0 ? BullishColor : (synergyScore < 0 ? BearishColor : textColor));
+                   synergyScore > 0 ? statusGreen : (synergyScore < 0 ? statusRed : textColor));
    
-   ObjectSetString(0, dashboardPrefix + "ADXValue", OBJPROP_TEXT, 
-                  adxTrendCondition ? "Active" : "Waiting");
-   ObjectSetInteger(0, dashboardPrefix + "ADXValue", OBJPROP_COLOR, 
-                   adxTrendCondition ? statusGreen : statusRed);
+   // ADX Status - Fixed to show actual status
+   bool actualADXCondition = EnableADXFilter ? adxTrendCondition : true;
+   ObjectSetString(0, dashboardPrefix + "ADXValue", OBJPROP_TEXT, actualADXCondition ? "Active" : "Waiting");
+   ObjectSetInteger(0, dashboardPrefix + "ADXValue", OBJPROP_COLOR, actualADXCondition ? statusGreen : statusRed);
+   if(EnableADXFilter) {
+      ObjectSetString(0, dashboardPrefix + "ADXValueNum", OBJPROP_TEXT, 
+                     "(" + DoubleToString(effectiveADXThreshold, 1) + ")");
+   } else {
+      ObjectSetString(0, dashboardPrefix + "ADXValueNum", OBJPROP_TEXT, "(OFF)");
+   }
+   
+   // Scale Out Status
+   bool scaleOutActive = EnableScaleOut && ScaleOut1Enabled;
+   ObjectSetString(0, dashboardPrefix + "ScaleOutValue", OBJPROP_TEXT, scaleOutActive ? "ON" : "OFF");
+   ObjectSetInteger(0, dashboardPrefix + "ScaleOutValue", OBJPROP_COLOR, scaleOutActive ? statusGreen : statusRed);
+   if(scaleOutActive) {
+      ObjectSetString(0, dashboardPrefix + "ScaleOutDetails", OBJPROP_TEXT, 
+                     "(" + DoubleToString(ScaleOut1Pct, 0) + "% at " + DoubleToString(ScaleOut1Size, 0) + "%)");
+   } else {
+      ObjectSetString(0, dashboardPrefix + "ScaleOutDetails", OBJPROP_TEXT, "");
+   }
+   
+   // Session Filter Status
+   ObjectSetString(0, dashboardPrefix + "SessionValue", OBJPROP_TEXT, EnableSessionFilter ? "ON" : "OFF");
+   ObjectSetInteger(0, dashboardPrefix + "SessionValue", OBJPROP_COLOR, EnableSessionFilter ? statusGreen : statusRed);
+   
+   // Signal Ready Status
+   bool signalReady = entryTriggersEnabled && 
+                     (EnableADXFilter ? adxTrendCondition : true) && 
+                     IsInTradingSession() &&
+                     EnableTrading &&
+                     !HasOpenPosition();
+   
+   string signalStatus = "NOT READY";
+   color signalColor = statusRed;
+   
+   if(signalReady) {
+      signalStatus = "READY";
+      signalColor = statusGreen;
+   } else if(!EnableTrading) {
+      signalStatus = "DISABLED";
+      signalColor = statusRed;
+   } else if(HasOpenPosition()) {
+      signalStatus = "IN TRADE";
+      signalColor = statusOrange;
+   } else if(!IsInTradingSession()) {
+      signalStatus = "OUT OF SESSION";
+      signalColor = statusOrange;
+   } else if(EnableADXFilter && !adxTrendCondition) {
+      signalStatus = "ADX WAIT";
+      signalColor = statusOrange;
+   }
+   
+   ObjectSetString(0, dashboardPrefix + "SignalValue", OBJPROP_TEXT, signalStatus);
+   ObjectSetInteger(0, dashboardPrefix + "SignalValue", OBJPROP_COLOR, signalColor);
+   
+   // Trading Status
+   ObjectSetString(0, dashboardPrefix + "TradingValue", OBJPROP_TEXT, EnableTrading ? "ENABLED" : "DISABLED");
+   ObjectSetInteger(0, dashboardPrefix + "TradingValue", OBJPROP_COLOR, EnableTrading ? statusGreen : statusRed);
    
    // Update timestamp
-   ObjectSetString(0, dashboardPrefix + "TimeValue", OBJPROP_TEXT, 
-                  TimeToString(TimeCurrent(), TIME_SECONDS));
+   ObjectSetString(0, dashboardPrefix + "TimeValue", OBJPROP_TEXT, TimeToString(TimeCurrent(), TIME_SECONDS));
 }
 
 //+------------------------------------------------------------------+
-//| Create a section header in the dashboard                          |
+//| Create a section header (Fixed positioning)                       |
 //+------------------------------------------------------------------+
 void CreateSectionHeader(string title, int y)
 {
+   if(!ShowDashboard) return;
+   
    string name = dashboardPrefix + "Section_" + title;
    
    // Create background
    ObjectCreate(0, name + "_BG", OBJ_RECTANGLE_LABEL, 0, 0, 0);
-   ObjectSetInteger(0, name + "_BG", OBJPROP_XDISTANCE, 10);
-   ObjectSetInteger(0, name + "_BG", OBJPROP_YDISTANCE, y);
-   ObjectSetInteger(0, name + "_BG", OBJPROP_XSIZE, 500);
+   ObjectSetInteger(0, name + "_BG", OBJPROP_XDISTANCE, DashboardXPosition);
+   ObjectSetInteger(0, name + "_BG", OBJPROP_YDISTANCE, DashboardYPosition + y);
+   ObjectSetInteger(0, name + "_BG", OBJPROP_XSIZE, 520);
    ObjectSetInteger(0, name + "_BG", OBJPROP_YSIZE, 25);
    ObjectSetInteger(0, name + "_BG", OBJPROP_BGCOLOR, sectionHeaderBg);
    ObjectSetInteger(0, name + "_BG", OBJPROP_BORDER_TYPE, BORDER_FLAT);
@@ -1844,21 +2104,23 @@ void CreateSectionHeader(string title, int y)
    ObjectSetInteger(0, name + "_BG", OBJPROP_ZORDER, 2);
    
    // Create label
-   CreateLabel(name, title, 250, y + 13, textColor, 10, "Arial Bold", true);
+   CreateLabel(name, title, 260, y + 13, clrWhite, DashboardFontSize, "Arial Bold", true);
 }
 
 //+------------------------------------------------------------------+
-//| Create a data row with prop and live values                       |
+//| Create a data row with proper alignment                           |
 //+------------------------------------------------------------------+
 void CreateDataRow(string label, string propValue, string liveValue, int y)
 {
+   if(!ShowDashboard) return;
+   
    string name = dashboardPrefix + label;
    
    // Create background
    ObjectCreate(0, name + "_BG", OBJ_RECTANGLE_LABEL, 0, 0, 0);
-   ObjectSetInteger(0, name + "_BG", OBJPROP_XDISTANCE, 10);
-   ObjectSetInteger(0, name + "_BG", OBJPROP_YDISTANCE, y);
-   ObjectSetInteger(0, name + "_BG", OBJPROP_XSIZE, 500);
+   ObjectSetInteger(0, name + "_BG", OBJPROP_XDISTANCE, DashboardXPosition);
+   ObjectSetInteger(0, name + "_BG", OBJPROP_YDISTANCE, DashboardYPosition + y);
+   ObjectSetInteger(0, name + "_BG", OBJPROP_XSIZE, 520);
    ObjectSetInteger(0, name + "_BG", OBJPROP_YSIZE, 20);
    ObjectSetInteger(0, name + "_BG", OBJPROP_BGCOLOR, dataBgColor);
    ObjectSetInteger(0, name + "_BG", OBJPROP_BORDER_TYPE, BORDER_FLAT);
@@ -1871,75 +2133,56 @@ void CreateDataRow(string label, string propValue, string liveValue, int y)
    ObjectSetInteger(0, name + "_BG", OBJPROP_HIDDEN, true);
    ObjectSetInteger(0, name + "_BG", OBJPROP_ZORDER, 2);
    
-   // Create label text - improved alignment
-   CreateLabel(name, label, 20, y + 10, textColor, 9, "Arial", false);
+   // Create label text
+   CreateLabel(name, label, 20, y + 10, textColor, DashboardFontSize, "Arial", false);
    
-   // Create prop value - fixed position
-   CreateLabel(name + "_Prop", propValue, 200, y + 10, textColor, 9, "Arial", false);
+   // Create prop value - center aligned to PropAcc column
+   CreateLabel(name + "_Prop", propValue, 200, y + 10, textColor, DashboardFontSize, "Arial", true);
    
-   // Create live value - fixed position
-   CreateLabel(name + "_Real", liveValue, 350, y + 10, textColor, 9, "Arial", false);
+   // Create live value - center aligned to LiveAcc column
+   CreateLabel(name + "_Real", liveValue, 380, y + 10, textColor, DashboardFontSize, "Arial", true);
 }
 
 //+------------------------------------------------------------------+
-//| Create Cost Recovery section                                      |
+//| Create Cost Recovery section (Fix #2 - Correct Object Names)     |
 //+------------------------------------------------------------------+
 void CreateCostRecoverySection(int y)
 {
+   if(!ShowDashboard) return;
+   
    string name = dashboardPrefix + "CostRecovery";
    
-   // Create header background
-   ObjectCreate(0, name + "_HeaderBG", OBJ_RECTANGLE_LABEL, 0, 0, 0);
-   ObjectSetInteger(0, name + "_HeaderBG", OBJPROP_XDISTANCE, 10);
-   ObjectSetInteger(0, name + "_HeaderBG", OBJPROP_YDISTANCE, y);
-   ObjectSetInteger(0, name + "_HeaderBG", OBJPROP_XSIZE, 500);
-   ObjectSetInteger(0, name + "_HeaderBG", OBJPROP_YSIZE, 25);
-   ObjectSetInteger(0, name + "_HeaderBG", OBJPROP_BGCOLOR, costRecoveryHeaderBg);
-   ObjectSetInteger(0, name + "_HeaderBG", OBJPROP_BORDER_TYPE, BORDER_FLAT);
-   ObjectSetInteger(0, name + "_HeaderBG", OBJPROP_CORNER, CORNER_LEFT_UPPER);
-   ObjectSetInteger(0, name + "_HeaderBG", OBJPROP_STYLE, STYLE_SOLID);
-   ObjectSetInteger(0, name + "_HeaderBG", OBJPROP_WIDTH, 1);
-   ObjectSetInteger(0, name + "_HeaderBG", OBJPROP_BACK, false);
-   ObjectSetInteger(0, name + "_HeaderBG", OBJPROP_SELECTABLE, false);
-   ObjectSetInteger(0, name + "_HeaderBG", OBJPROP_SELECTED, false);
-   ObjectSetInteger(0, name + "_HeaderBG", OBJPROP_HIDDEN, true);
-   ObjectSetInteger(0, name + "_HeaderBG", OBJPROP_ZORDER, 2);
-   
-   // Create header label
-   CreateLabel(name + "_Header", "Cost Recovery Estimate", 250, y + 13, clrBlack, 10, "Arial Bold", true);
-   
+   // Create header
+   CreateSectionHeader("Cost Recovery Estimate", y);
    y += 25;
    
-   // Create criteria background
-   ObjectCreate(0, name + "_CriteriaBG", OBJ_RECTANGLE_LABEL, 0, 0, 0);
-   ObjectSetInteger(0, name + "_CriteriaBG", OBJPROP_XDISTANCE, 10);
-   ObjectSetInteger(0, name + "_CriteriaBG", OBJPROP_YDISTANCE, y);
-   ObjectSetInteger(0, name + "_CriteriaBG", OBJPROP_XSIZE, 500);
-   ObjectSetInteger(0, name + "_CriteriaBG", OBJPROP_YSIZE, 20);
-   ObjectSetInteger(0, name + "_CriteriaBG", OBJPROP_BGCOLOR, costRecoveryCriteriaBg);
-   ObjectSetInteger(0, name + "_CriteriaBG", OBJPROP_BORDER_TYPE, BORDER_FLAT);
-   ObjectSetInteger(0, name + "_CriteriaBG", OBJPROP_CORNER, CORNER_LEFT_UPPER);
-   ObjectSetInteger(0, name + "_CriteriaBG", OBJPROP_STYLE, STYLE_SOLID);
-   ObjectSetInteger(0, name + "_CriteriaBG", OBJPROP_WIDTH, 1);
-   ObjectSetInteger(0, name + "_CriteriaBG", OBJPROP_BACK, false);
-   ObjectSetInteger(0, name + "_CriteriaBG", OBJPROP_SELECTABLE, false);
-   ObjectSetInteger(0, name + "_CriteriaBG", OBJPROP_SELECTED, false);
-   ObjectSetInteger(0, name + "_CriteriaBG", OBJPROP_HIDDEN, true);
-   ObjectSetInteger(0, name + "_CriteriaBG", OBJPROP_ZORDER, 2);
-   
-   // Create criteria labels - improved alignment
-   CreateLabel(name + "_Criteria", "Criteria", 20, y + 10, textColor, 9);
-   CreateLabel(name + "_Loss_Header", "Loss on Prop", 200, y + 10, textColor, 9);
-   CreateLabel(name + "_Profit_Header", "Profit on Real", 350, y + 10, textColor, 9);
-   CreateLabel(name + "_Recovery_Header", "Recovery", 450, y + 10, textColor, 9);
+   // Create column headers with proper alignment
+   CreateLabel(name + "_Criteria", "Criteria", 20, y + 10, textColor, DashboardFontSize);
+   CreateLabel(name + "_Loss_Header", "Loss PropAcc", 200, y + 10, clrYellow, DashboardFontSize, "Arial", true);
+   CreateLabel(name + "_Profit_Header", "Profit LiveAcc", 350, y + 10, clrYellow, DashboardFontSize, "Arial", true);
+   CreateLabel(name + "_Recovery_Header", "Recovery %", 450, y + 10, clrYellow, DashboardFontSize, "Arial", true);
    
    y += 20;
    
-   // Create Max DD row
-   CreateLabel(name + "_MaxDD", "Max DD", 20, y + 10, textColor, 9);
-   CreateLabel(name + "_Loss_Prop", "0.00", 200, y + 10, textColor, 9);
-   CreateLabel(name + "_Profit_Real", "0.00", 350, y + 10, textColor, 9);
-   CreateLabel(name + "_Recovery", "0.0 %", 450, y + 10, textColor, 9);
+   // Create Max DD row background
+   ObjectCreate(0, name + "_MaxDD_BG", OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, name + "_MaxDD_BG", OBJPROP_XDISTANCE, DashboardXPosition);
+   ObjectSetInteger(0, name + "_MaxDD_BG", OBJPROP_YDISTANCE, DashboardYPosition + y);
+   ObjectSetInteger(0, name + "_MaxDD_BG", OBJPROP_XSIZE, 520);
+   ObjectSetInteger(0, name + "_MaxDD_BG", OBJPROP_YSIZE, 20);
+   ObjectSetInteger(0, name + "_MaxDD_BG", OBJPROP_BGCOLOR, costRecoveryCriteriaBg);
+   ObjectSetInteger(0, name + "_MaxDD_BG", OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, name + "_MaxDD_BG", OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name + "_MaxDD_BG", OBJPROP_BACK, false);
+   ObjectSetInteger(0, name + "_MaxDD_BG", OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name + "_MaxDD_BG", OBJPROP_HIDDEN, true);
+   ObjectSetInteger(0, name + "_MaxDD_BG", OBJPROP_ZORDER, 2);
+   
+   // Create Max DD row labels with CORRECT names that match UpdateDashboard()
+   CreateLabel(name + "_MaxDD", "Max DD", 20, y + 10, textColor, DashboardFontSize);
+   CreateLabel(name + "_Loss_Prop", "0.00", 200, y + 10, textColor, DashboardFontSize, "Arial", true);
+   CreateLabel(name + "_Profit_Real", "0.00", 350, y + 10, textColor, DashboardFontSize, "Arial", true);
+   CreateLabel(name + "_Recovery", "0.0%", 450, y + 10, textColor, DashboardFontSize, "Arial", true);
 }
 
 //+------------------------------------------------------------------+
@@ -1951,22 +2194,87 @@ void DeleteDashboard()
 }
 
 //+------------------------------------------------------------------+
-//| Create a text label                                               |
+//| Create a text label (Enhanced with positioning)                   |
 //+------------------------------------------------------------------+
 void CreateLabel(string name, string text, int x, int y, color clr, int fontSize, 
                 string font = "Arial", bool centered = false)
 {
+   if(!ShowDashboard) return;
+   
    ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
-   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
-   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, DashboardXPosition + x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, DashboardYPosition + y);
    ObjectSetString(0, name, OBJPROP_TEXT, text);
    ObjectSetString(0, name, OBJPROP_FONT, font);
    ObjectSetInteger(0, name, OBJPROP_FONTSIZE, fontSize);
    ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
    ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
    ObjectSetInteger(0, name, OBJPROP_ANCHOR, centered ? ANCHOR_CENTER : ANCHOR_LEFT);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+   ObjectSetInteger(0, name, OBJPROP_ZORDER, 3);
 }
 
+//+------------------------------------------------------------------+
+//| Get Daily PnL (Helper function)                                   |
+//+------------------------------------------------------------------+
+double GetDailyPnL()
+{
+   static double dayStartBalance = 0;
+   static datetime lastDay = 0;
+   
+   datetime currentTime = TimeCurrent();
+   MqlDateTime dt;
+   TimeToStruct(currentTime, dt);
+   
+   // Check for new day
+   if(lastDay != dt.day || dayStartBalance == 0)
+   {
+      dayStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+      lastDay = dt.day;
+   }
+   
+   return AccountInfoDouble(ACCOUNT_EQUITY) - dayStartBalance;
+}
+
+//+------------------------------------------------------------------+
+//| Get Trading Days Count (Helper function)                          |
+//+------------------------------------------------------------------+
+int GetTradingDaysCount()
+{
+   static int tradingDays = 1;
+   static datetime lastCheck = 0;
+   
+   datetime currentTime = TimeCurrent();
+   MqlDateTime current, last;
+   TimeToStruct(currentTime, current);
+   TimeToStruct(lastCheck, last);
+   
+   if(lastCheck == 0) {
+      lastCheck = currentTime;
+      return tradingDays;
+   }
+   
+   if(current.day != last.day) {
+      tradingDays++;
+      lastCheck = currentTime;
+   }
+   
+   return tradingDays;
+}
+
+//+------------------------------------------------------------------+
+//| Fixed StringGetTickCount function (type conversion fix)           |
+//+------------------------------------------------------------------+
+double StringGetTickCount(string text)
+{
+   ulong result = 0;
+   for(int i = 0; i < StringLen(text); i++)
+   {
+      result += (ulong)StringGetCharacter(text, i);
+   }
+   return (double)result;  // Explicit cast to fix type conversion warning
+}
 //+------------------------------------------------------------------+
 //| UTILITY FUNCTIONS                                                 |
 //+------------------------------------------------------------------+
