@@ -673,10 +673,12 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    if(trans.type!=TRADE_TRANSACTION_DEAL_ADD) return;
    if(trans.symbol!=_Symbol)                  return;
 
-   // Ignore EA managed positions
-   if(trans.magic==Magic_Number) return;
+   // Ignore EA managed positions (fallback via history lookup)
+   long dealMagic = HistoryDealGetInteger(trans.deal, DEAL_MAGIC);
+   if(dealMagic==Magic_Number) return;
 
-   if(trans.deal_entry==DEAL_ENTRY_IN)
+   ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+   if(entry==DEAL_ENTRY_IN)
    {
       bool isLong = (trans.deal_type==DEAL_TYPE_BUY);
 
@@ -686,7 +688,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
       SendHedgeSignal("OPEN", isLong?"SELL":"BUY", hedgeLotsLast,
                       trans.price_tp, trans.price_sl);
    }
-   else if(trans.deal_entry==DEAL_ENTRY_OUT)
+   else if(entry==DEAL_ENTRY_OUT)
    {
       bool closingLong  = (trans.deal_type==DEAL_TYPE_SELL);
       double vol        = NormalizeLots(trans.volume*hedgeFactor);
