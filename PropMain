@@ -674,6 +674,18 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    if(trans.symbol!=_Symbol)                  return;
 
 
+   // Lookup the just created deal for reliable details
+   if(!HistoryDealSelect(trans.deal))
+      return; // no info available
+
+   long          magic = (long)HistoryDealGetInteger(trans.deal, DEAL_MAGIC);
+   ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+
+   // Ignore EA managed positions
+   if(magic==Magic_Number) return;
+
+   if(entry==DEAL_ENTRY_IN)
+
    // Pull deal info from history for reliability
    long dealMagic = trans.deal_magic;
    long dealEntry = trans.entry;
@@ -704,6 +716,9 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
       SendHedgeSignal("OPEN", isLong?"SELL":"BUY", hedgeLotsLast,
                       trans.price_tp, trans.price_sl);
    }
+
+   else if(entry==DEAL_ENTRY_OUT)
+
 
    else if(dealEntry==DEAL_ENTRY_OUT)
 
