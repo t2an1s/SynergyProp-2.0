@@ -89,7 +89,7 @@ input bool      ShowMarketBias = true;                // Show Market Bias Indica
 //| Input Parameters - Risk Management                               |
 //+------------------------------------------------------------------+
 input group "Risk Management"
-input double    RiskPercent = 0.3;                     // Risk Percent per Trade
+input double    RiskPercent = 0.3;                     // Risk Percent per Trade (% of balance)
 input bool      UseFixedLot = false;                   // Use Fixed Lot Size
 input double    FixedLotSize = 0.01;                   // Fixed Lot Size
 input double    MinLot = 0.01;                         // Minimum Lot Size
@@ -1133,6 +1133,13 @@ void OpenTrade(bool isLong, const double sl, const double tp)
    double tpAdj = tp;
    EnsureValidStops(isLong, slAdj, tpAdj);
 
+   // Fail-safe: never open a trade without valid stops
+   if(slAdj <= 0 || tpAdj <= 0)
+   {
+      Print("OpenTrade(): invalid SL/TP - trade aborted");
+      return;
+   }
+
    //––– lot-size
    double slPips = MathAbs(Close[0]-slAdj) / GetPipSize();
    
@@ -2012,6 +2019,7 @@ bool HasOpenPosition()
 //+------------------------------------------------------------------+
 //| Calculate position size based on risk                            |
 //+------------------------------------------------------------------+
+// riskPercent parameter expects a percentage value (e.g. 0.3 for 0.3%)
 double CalculatePositionSize(double slPips, double riskPercent)
 {
    // Add validation and logging
