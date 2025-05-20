@@ -8,8 +8,6 @@
 //|   • Re‑implemented pivot‑scan functions with bounds checks       |
 //|   • Safe CopyBuffer calls with early return on incomplete data   |
 //|   • Hardened CalculateEMAValue & CalculateADXFilter              |
-        codex/fix-manual-trade-not-triggering-hedge-logic
-//|   • Added manual trade handler (OnTradeTransaction)              |
 //|   • Manual trades trigger hedge via OnTradeTransaction           |
 //+------------------------------------------------------------------+
 #property copyright "t2an1s"
@@ -676,15 +674,9 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    if(trans.symbol!=_Symbol)                  return;
 
    // Ignore EA managed positions
-
-   if(trans.order_magic==Magic_Number) return;
-
-   if(trans.entry==DEAL_ENTRY_IN)
-
    if(trans.magic==Magic_Number) return;
 
    if(trans.deal_entry==DEAL_ENTRY_IN)
-
    {
       bool isLong = (trans.deal_type==DEAL_TYPE_BUY);
 
@@ -692,15 +684,9 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
       hedgeLotsLast  = NormalizeLots(lastEntryLots*hedgeFactor);
 
       SendHedgeSignal("OPEN", isLong?"SELL":"BUY", hedgeLotsLast,
-
-                      trans.tp, trans.sl);
-   }
-   else if(trans.entry==DEAL_ENTRY_OUT)
-
                       trans.price_tp, trans.price_sl);
    }
    else if(trans.deal_entry==DEAL_ENTRY_OUT)
-
    {
       bool closingLong  = (trans.deal_type==DEAL_TYPE_SELL);
       double vol        = NormalizeLots(trans.volume*hedgeFactor);
