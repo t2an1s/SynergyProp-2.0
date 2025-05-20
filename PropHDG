@@ -616,11 +616,19 @@ void ProcessSignal(string signalType,string direction,double volume,double tp,do
 
    if(signalType=="OPEN")
    {
+      bool ok=false;
       if(direction=="BUY" && volume>0)
-         trade.Buy(volume,_Symbol,0,sl,tp,"Hedge");
+         ok=trade.Buy(volume,_Symbol,0,sl,tp,"Hedge");
       else if(direction=="SELL"&& volume>0)
-         trade.Sell(volume,_Symbol,0,sl,tp,"Hedge");
-      Print("Hedge OPEN ",direction," ",DoubleToString(volume,2));
+         ok=trade.Sell(volume,_Symbol,0,sl,tp,"Hedge");
+
+      int ret=trade.ResultRetcode();
+      if(!ok)
+         Print("ERROR: Hedge OPEN failed retcode ",ret,
+               " err=",GetLastError());
+      else
+         Print("Hedge OPEN ",direction," ",DoubleToString(volume,2),
+               " ret=",ret);
    }
    else if(signalType=="MODIFY")
    {
