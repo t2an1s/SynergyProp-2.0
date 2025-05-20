@@ -1,18 +1,20 @@
 //+------------------------------------------------------------------+
-//|                                       Synergy_Strategy_v1.02.mq5 |
+//|                                       Synergy_Strategy_v1.03.mq5 |
 //|  Streamlined Synergy Strategy + PropEA‑style Hedge Engine (port) |
 //|                                                                  |
-//|  CHANGE LOG (v1.02 – 20‑May‑2025)                                |
+//|  CHANGE LOG (v1.03 – 20‑May‑2025)                                |
 //|   • Added BARS_REQUIRED constant and warm‑up guard               |
 //|   • Robust history copying & buffer guards (no array overflow)   |
 //|   • Re‑implemented pivot‑scan functions with bounds checks       |
 //|   • Safe CopyBuffer calls with early return on incomplete data   |
 //|   • Hardened CalculateEMAValue & CalculateADXFilter              |
 //|   • Manual trades trigger hedge via OnTradeTransaction           |
+//|   • Replaced external Heiken Ashi indicator with built‑in        |
+//|     calculation to avoid load errors                             |
 //+------------------------------------------------------------------+
 #property copyright "t2an1s"
 #property link      "http://www.yourwebsite.com"
-#property version   "1.02"
+#property version   "1.03"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -213,7 +215,7 @@ double rsiBuffer_H1[], maFastBuffer_H1[], maSlowBuffer_H1[], macdBuffer_H1[], ma
 double synergyScore;
 
 // Market bias variables
-int haHandle;
+int haHandle = INVALID_HANDLE;
 double haOpen[], haHigh[], haLow[], haClose[];
 double oscBias, oscSmooth;
 bool biasChangedToBullish = false;
@@ -1391,25 +1393,15 @@ void ReleaseSynergyIndicators()
 bool InitMarketBias()
 {
    if(!UseMarketBias) return true;
-   
-   // Get the appropriate timeframe
-   ENUM_TIMEFRAMES tf = GetTimeframeFromString(BiasTimeframe);
-   
-   // Create Heikin-Ashi indicator handle
-   haHandle = iCustom(_Symbol, tf, "Heiken_Ashi");
-   
-   if(haHandle == INVALID_HANDLE)
-   {
-      Print("Error initializing Heikin Ashi indicator: ", GetLastError());
-      return false;
-   }
-   
-   // Set arrays as series
-   ArraySetAsSeries(haOpen, true);
-   ArraySetAsSeries(haHigh, true);
-   ArraySetAsSeries(haLow, true);
+
+   // no external indicator needed – we'll compute Heiken Ashi manually
+   haHandle = INVALID_HANDLE;
+
+   ArraySetAsSeries(haOpen,  true);
+   ArraySetAsSeries(haHigh,  true);
+   ArraySetAsSeries(haLow,   true);
    ArraySetAsSeries(haClose, true);
-   
+
    return true;
 }
 
@@ -1419,20 +1411,41 @@ bool InitMarketBias()
 bool CalculateMarketBias()
 {
    if(!UseMarketBias) return true;
-   
-   // Get the appropriate timeframe
+
    ENUM_TIMEFRAMES tf = GetTimeframeFromString(BiasTimeframe);
-   
-   // Copy Heikin Ashi values
-   if(CopyBuffer(haHandle, 0, 0, HeikinAshiPeriod+1, haOpen) <= 0) return false;
-   if(CopyBuffer(haHandle, 1, 0, HeikinAshiPeriod+1, haHigh) <= 0) return false;
-   if(CopyBuffer(haHandle, 2, 0, HeikinAshiPeriod+1, haLow) <= 0) return false;
-   if(CopyBuffer(haHandle, 3, 0, HeikinAshiPeriod+1, haClose) <= 0) return false;
-   
-   // Calculate smoothed values using manual EMA calculation instead of function
-   double o = CalculateEMAValue(haOpen, HeikinAshiPeriod);
-   double h = CalculateEMAValue(haHigh, HeikinAshiPeriod);
-   double l = CalculateEMAValue(haLow, HeikinAshiPeriod);
+
+   int need = HeikinAshiPeriod + 1;
+   MqlRates rates[];
+   if(CopyRates(_Symbol, tf, 0, need, rates) < need)
+      return false;
+   ArraySetAsSeries(rates, true);
+
+   ArrayResize(haOpen, need);
+   ArrayResize(haHigh, need);
+   ArrayResize(haLow,  need);
+   ArrayResize(haClose,need);
+
+   for(int i = need - 1; i >= 0; --i)
+   {
+      double cPrice = (rates[i].open + rates[i].high + rates[i].low + rates[i].close) / 4.0;
+      double oPrice;
+      if(i == need - 1)
+         oPrice = (rates[i].open + rates[i].close) / 2.0;
+      else
+         oPrice = (haOpen[i+1] + haClose[i+1]) / 2.0;
+
+      double hPrice = MathMax(rates[i].high, MathMax(oPrice, cPrice));
+      double lPrice = MathMin(rates[i].low,  MathMin(oPrice, cPrice));
+
+      haOpen[i]  = oPrice;
+      haHigh[i]  = hPrice;
+      haLow[i]   = lPrice;
+      haClose[i] = cPrice;
+   }
+
+   double o = CalculateEMAValue(haOpen,  HeikinAshiPeriod);
+   double h = CalculateEMAValue(haHigh,  HeikinAshiPeriod);
+   double l = CalculateEMAValue(haLow,   HeikinAshiPeriod);
    double c = CalculateEMAValue(haClose, HeikinAshiPeriod);
    
    // Calculate oscillator
