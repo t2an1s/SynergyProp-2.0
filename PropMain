@@ -44,12 +44,13 @@ bool   inSession            = true;
 // ── Hedge-link monitor ─────────────────────────────────────────────
 const int    HEARTBEAT_SEC    = 5;          // how often we publish our pulse
 const int    LINK_TIMEOUT_SEC = 15;         // grace window before status = NOT OK
-
 ulong        lastPulseSent    = 0;          // when we last pinged the other side
 bool         linkWasOK        = false;      // remembers previous state for debug prints
-
-// path to the shared signal file when FILE_BASED communication is used
-string       SignalFilePath   = "";
+string COMM_FILE_PATH = "MQL5\\Files\\MT5com.txt";
+string HEARTBEAT_FILE_PATH = "MQL5\\Files\\MT5com_heartbeat.txt";
+string HEDGE_HEARTBEAT_FILE_PATH = "MQL5\\Files\\MT5com_hedge_heartbeat.txt";
+const int FILE_WRITE_RETRY = 3;
+const int FILE_CHECK_SECONDS = 5;
 
 
 //--------------------------------------------------------------------
@@ -60,7 +61,7 @@ inline bool CopyOk(int want, int got){ return got==want; }
 //+------------------------------------------------------------------+
 //| Enumeration for Communication Method                              |
 //+------------------------------------------------------------------+
-enum ENUM_COMMUNICATION_METHOD {
+enum ENUM_COMMUNICATION_METHOD { 
    GLOBAL_VARS,   // Global Variables
    FILE_BASED     // File-Based
 };
@@ -226,68 +227,177 @@ double effectiveADXThreshold;
 bool adxTrendCondition;
 
 // Prop EA sends “PROP_HB_{magic}”; hedge EA sends “HEDGE_HB_{magic}”
+//────────────────────────────────────────────────────────────────────
+// REPLACE THE SendHeartbeat FUNCTION
+//────────────────────────────────────────────────────────────────────
 void SendHeartbeat(bool isPropSide)
 {
    if(!EnableHedgeCommunication) return;
    
-   // For the main EA, create a variable that the hedge EA will look for
-   string name = "PROP_HB_" + IntegerToString(Magic_Number);
-   double currentTime = (double)TimeCurrent();
-   GlobalVariableSet(name, currentTime);
-   lastPulseSent = (ulong)TimeCurrent();
-   
-   // Periodically print debug info (once every minute)
-   static datetime lastPrintTime = 0;
-   if(TimeCurrent() - lastPrintTime > 60) {
-      Print("Main EA heartbeat sent: ", name, " = ", TimeToString((datetime)currentTime));
-      lastPrintTime = TimeCurrent();
+   if(CommunicationMethod == GLOBAL_VARS)
+   {
+      // Original global variable code
+      string name = "PROP_HB_" + IntegerToString(Magic_Number);
+      double currentTime = (double)TimeCurrent();
+      GlobalVariableSet(name, currentTime);
+      lastPulseSent = (ulong)TimeCurrent();
+      
+      // Periodically print debug info
+      static datetime lastPrintTime = 0;
+      if(TimeCurrent() - lastPrintTime > 60) {
+         Print("Main EA heartbeat sent: ", name, " = ", TimeToString((datetime)currentTime));
+         lastPrintTime = TimeCurrent();
+      }
+   }
+   else // FILE_BASED
+   {
+      // Create heartbeat file with timestamp
+      int fileHandle = FileOpen(HEARTBEAT_FILE_PATH, FILE_WRITE|FILE_TXT|FILE_COMMON);
+      if(fileHandle != INVALID_HANDLE)
+      {
+         string heartbeatData = "MAIN_HEARTBEAT," + IntegerToString(Magic_Number) + "," + 
+                               IntegerToString(TimeCurrent());
+         FileWriteString(fileHandle, heartbeatData);
+         FileClose(fileHandle);
+         
+         // Report success with lower frequency to avoid log spam
+         static datetime lastReport = 0;
+         if(TimeCurrent() - lastReport > 60) {  // Report once per minute
+            Print("Main EA heartbeat sent to file: ", HEARTBEAT_FILE_PATH);
+            lastReport = TimeCurrent();
+         }
+      }
+      else
+      {
+         int error = GetLastError();
+         Print("ERROR: Failed to write heartbeat file: ", error);
+      }
+      
+      lastPulseSent = (ulong)TimeCurrent();
    }
 }
 
-//  ── check if opposite side is alive
+//────────────────────────────────────────────────────────────────────
+// REPLACE THE IsLinkAlive FUNCTION
+//────────────────────────────────────────────────────────────────────
 bool IsLinkAlive(bool isPropSide)
 {
    if(!EnableHedgeCommunication) return false;
    
-   // Main EA checks for hedge EA's heartbeat
-   string peer = "HEDGE_HB_" + IntegerToString(HedgeEA_Magic);
-   
-   if(!GlobalVariableCheck(peer)) {
-      static datetime lastErrorTime = 0;
-      if(TimeCurrent() - lastErrorTime > 60) {
-         Print("ERROR: Hedge heartbeat not found: ", peer);
-         lastErrorTime = TimeCurrent();
+   if(CommunicationMethod == GLOBAL_VARS)
+   {
+      // Original global variable code
+      string peer = "HEDGE_HB_" + IntegerToString(HedgeEA_Magic);
+      
+      if(!GlobalVariableCheck(peer)) {
+         static datetime lastErrorTime = 0;
+         if(TimeCurrent() - lastErrorTime > 60) {
+            Print("ERROR: Hedge heartbeat not found: ", peer);
+            lastErrorTime = TimeCurrent();
+         }
+         return false;
       }
-      return false;
+      
+      double ts = GlobalVariableGet(peer);
+      bool isAlive = (TimeCurrent() - (datetime)ts) <= LINK_TIMEOUT_SEC;
+      
+      // Log periodic status
+      static datetime lastStatusTime = 0;
+      if(TimeCurrent() - lastStatusTime > 60) {
+         Print("Hedge link status: ", isAlive ? "ALIVE" : "DEAD", 
+               " (Last beat: ", TimeToString((datetime)ts), 
+               ", Age: ", TimeCurrent() - (datetime)ts, "s)");
+         lastStatusTime = TimeCurrent();
+      }
+      
+      return isAlive;
    }
-   
-   double ts = GlobalVariableGet(peer);
-   bool isAlive = (TimeCurrent() - (datetime)ts) <= LINK_TIMEOUT_SEC;
-   
-   // Log periodic status
-   static datetime lastStatusTime = 0;
-   if(TimeCurrent() - lastStatusTime > 60) {
-      Print("Hedge link status: ", isAlive ? "ALIVE" : "DEAD", 
-            " (Last beat: ", TimeToString((datetime)ts), 
-            ", Age: ", TimeCurrent() - (datetime)ts, "s)");
-      lastStatusTime = TimeCurrent();
+   else // FILE_BASED
+   {
+      // Try to read hedge heartbeat file - MUST USE FILE_COMMON FLAG
+      if(!FileIsExist(HEDGE_HEARTBEAT_FILE_PATH, FILE_COMMON))
+      {
+         static datetime lastErrorReport = 0;
+         if(TimeCurrent() - lastErrorReport > 30) {  // Report every 30 seconds
+            Print("WARNING: Hedge heartbeat file not found: ", HEDGE_HEARTBEAT_FILE_PATH);
+            lastErrorReport = TimeCurrent();
+         }
+         return false;
+      }
+      
+      int fileHandle = FileOpen(HEDGE_HEARTBEAT_FILE_PATH, FILE_READ|FILE_TXT|FILE_COMMON);
+      if(fileHandle == INVALID_HANDLE)
+      {
+         Print("ERROR: Unable to open hedge heartbeat file. Error: ", GetLastError());
+         return false;
+      }
+      
+      string content = FileReadString(fileHandle);
+      FileClose(fileHandle);
+      
+      // Debug: Print what we read from file
+      Print("DEBUG: Read from hedge file: ", content);
+      
+      // Parse heartbeat data: format is HEDGE_HEARTBEAT,magicnumber,timestamp
+      string parts[];
+      int count = StringSplit(content, ',', parts);
+      
+      // Check if magic number matches
+      if(parts[1] != IntegerToString(HedgeEA_Magic))
+      {
+         Print("ERROR: Hedge heartbeat has incorrect magic number: ", parts[1], 
+               " expected: ", HedgeEA_Magic);
+         return false;
+      }
+      
+      // Check timestamp - FIXED CALCULATION
+      string timestampString = parts[2];
+      if(StringLen(timestampString) > 0)
+      {
+         datetime heartbeatTime = (datetime)StringToInteger(timestampString);
+         
+         if(heartbeatTime > 0)
+         {
+            int ageSeconds = (int)(TimeCurrent() - heartbeatTime);  // Cast to int for proper display
+            bool isAlive = ageSeconds <= LINK_TIMEOUT_SEC;
+            
+            // Log status periodically
+            static bool wasAlive = false;
+            static datetime lastStatusLog = 0;
+            
+            if(isAlive != wasAlive || TimeCurrent() - lastStatusLog > 60)
+            {
+               Print("Hedge link status: ", isAlive ? "ALIVE" : "DEAD", 
+                     " (Last heartbeat: ", TimeToString(heartbeatTime), 
+                     ", Age: ", ageSeconds, "s)");
+               lastStatusLog = TimeCurrent();
+               wasAlive = isAlive;
+            }
+            
+            return isAlive;
+         }
+         else
+         {
+            Print("ERROR: Invalid timestamp value: ", timestampString, " parsed as ", heartbeatTime);
+            return false;
+         }
+      }
+      else
+      {
+         Print("ERROR: Empty timestamp string in heartbeat");
+         return false;
+      }
    }
-   
-   return isAlive;
 }
 
-
-//+------------------------------------------------------------------+
+////+------------------------------------------------------------------+
 //| Expert initialization function                                    |
 //+------------------------------------------------------------------+
 int OnInit()
 {
-
    // Set this at the very beginning of OnInit
    EnableHedgeCommunication = InputEnableHedgeCommunication;
-   // Prepare shared file path for FILE_BASED communication
-   SignalFilePath = TerminalInfoString(TERMINAL_COMMONDATA_PATH) + "\\Synergy_Signals.txt";
-   
+
    // Set trade parameters
    trade.SetExpertMagicNumber(Magic_Number);
 
@@ -295,8 +405,37 @@ int OnInit()
    if(MQLInfoInteger(MQL_TESTER) || TestingMode)
    {
       // Disable hedge communication in tester
-      EnableHedgeCommunication = false;  // disable in tester
+      EnableHedgeCommunication = false;  
       Print("Running in Strategy Tester Mode - Hedge communication disabled");
+   }
+
+   // Initialize file paths for cross-terminal communication
+   if(EnableHedgeCommunication && CommunicationMethod == FILE_BASED)
+   {
+      // Use RELATIVE paths with FILE_COMMON flag (this is what was working before)
+      HEARTBEAT_FILE_PATH = "MQL5\\Files\\MT5com_heartbeat.txt";
+      HEDGE_HEARTBEAT_FILE_PATH = "MQL5\\Files\\MT5com_hedge_heartbeat.txt";
+      COMM_FILE_PATH = "MQL5\\Files\\MT5com.txt";
+      SignalFilePath = "MQL5\\Files\\Synergy_Signals.txt";
+      
+      // Test file access for heartbeat with FILE_COMMON flag
+      int fileHandle = FileOpen(HEARTBEAT_FILE_PATH, FILE_WRITE|FILE_TXT|FILE_COMMON);
+      if(fileHandle != INVALID_HANDLE)
+      {
+         FileWriteString(fileHandle, "MAIN_HEARTBEAT," + IntegerToString(Magic_Number) + "," + 
+                        IntegerToString(TimeCurrent()));
+         FileClose(fileHandle);
+         Print("File-based communication initialized. Magic: ", Magic_Number);
+         Print("Heartbeat file created: ", HEARTBEAT_FILE_PATH);
+      }
+      else
+      {
+         int errorCode = GetLastError();
+         Print("ERROR: Failed to create heartbeat file: ", errorCode);
+         Print("Path: ", HEARTBEAT_FILE_PATH);
+         Print("Will continue initialization - communication may be limited");
+         // Don't fail initialization - continue anyway
+      }
    }
    
    // Store initial balance
@@ -340,15 +479,10 @@ int OnInit()
 
    // Compute dynamic history requirement
    BARS_REQUIRED = MathMax(PivotTPBars + PivotLengthLeft + PivotLengthRight + 5, 100);
-      Print("History warm-up requirement set to ",BARS_REQUIRED," bars");   
+   Print("History warm-up requirement set to ",BARS_REQUIRED," bars");   
    
    // Create dashboard 
    CreateDashboard();
-   
-   // at the tail end of OnInit()
-   EventSetTimer(HEARTBEAT_SEC);          // start the timer that drives the heartbeat
-   SendHeartbeat(true);                   // first ping (true = prop side; hedge EA uses false)
-   linkWasOK = IsLinkAlive(true);
    
    // Initialize scale-out tracking variables
    scaleOut1LongTriggered = false;
@@ -367,44 +501,33 @@ int OnInit()
          // Initialize the global variables for the hedge EA to find
          GlobalVariableSet("PROP_HB_" + IntegerToString(Magic_Number), (double)TimeCurrent());
          GlobalVariableSet("EASignal_Connected_"+IntegerToString(HedgeEA_Magic), (double)TimeCurrent());
+         Print("Hedge communication enabled (Global Variables). Target EA Magic: ", HedgeEA_Magic);
          Print("Main EA registered heartbeat with Magic: ", Magic_Number);
          Print("Main EA looking for hedge with Magic: ", HedgeEA_Magic);
+         
+         // Add diagnostic output of all global variables
+         Print("--- GLOBAL VARIABLES AT INIT ---");
+         for(int i=0; i<GlobalVariablesTotal(); i++) {
+            string name = GlobalVariableName(i);
+            double value = GlobalVariableGet(name);
+            Print(name, " = ", value);
+         }
+         Print("-------------------------------");
       }
-      else
+      else // FILE_BASED
       {
-         // Prepare path in the terminal's common data folder
-         SignalFilePath = TerminalInfoString(TERMINAL_COMMONDATA_PATH) + "\\Synergy_Signals.txt";
-         // Test file creation for file-based communication
-         int fileHandle = FileOpen(SignalFilePath, FILE_WRITE|FILE_TXT);
-
-         if(fileHandle != INVALID_HANDLE)
-         {
-            FileWriteString(fileHandle, "INIT,"+ IntegerToString(TimeCurrent()));
-            FileClose(fileHandle);
-            Print("Hedge communication enabled (File-Based) via ", SignalFilePath,
-                  ". Target EA Magic: ", HedgeEA_Magic);
-         }
-         else
-         {
-            Print("Failed to initialize file-based communication at ", SignalFilePath,
-                  ". Error: ", GetLastError());
-            return(INIT_FAILED);
-         }
+         Print("File-based communication paths:");
+         Print("- Main heartbeat: ", HEARTBEAT_FILE_PATH);
+         Print("- Hedge heartbeat: ", HEDGE_HEARTBEAT_FILE_PATH);
+         Print("- Signal file: ", COMM_FILE_PATH);
+         Print("Hedge communication enabled (File-Based). Target EA Magic: ", HedgeEA_Magic);
       }
    }
 
+   // Start heartbeat system
    EventSetTimer(HEARTBEAT_SEC);
    SendHeartbeat(true);
    linkWasOK = IsLinkAlive(true);
-
-   // Add diagnostic output of all global variables
-   Print("--- GLOBAL VARIABLES AT INIT ---");
-   for(int i=0; i<GlobalVariablesTotal(); i++) {
-      string name = GlobalVariableName(i);
-      double value = GlobalVariableGet(name);
-      Print(name, " = ", value);
-   }
-   Print("-------------------------------");
 
    // Print initial settings for verification
    Print("SETTINGS VERIFICATION:");
@@ -415,6 +538,7 @@ int OnInit()
    Print("Magic_Number = ", Magic_Number);
    Print("HedgeEA_Magic = ", HedgeEA_Magic);
    Print("EnableHedgeCommunication = ", EnableHedgeCommunication ? "TRUE" : "FALSE");
+   Print("CommunicationMethod = ", CommunicationMethod == GLOBAL_VARS ? "GLOBAL_VARS" : "FILE_BASED");
    Print("Synergy Strategy v1.01 initialised. Hedge factor:",DoubleToString(hedgeFactor,4));
 
    return(INIT_SUCCEEDED);
@@ -1937,13 +2061,14 @@ double CalculateDailyPnL()
 //+------------------------------------------------------------------+
 //| Send hedge signal to hedge EA                                     |
 //+------------------------------------------------------------------+
+
 void SendHedgeSignal(string signalType, string direction, double volume, double tp, double sl)
 {
    if(!EnableHedgeCommunication) return;
    
    if(CommunicationMethod == GLOBAL_VARS)
    {
-      // Use global variables for communication
+      // Original global variable code
       string magicStr = IntegerToString(HedgeEA_Magic);
       GlobalVariableSet("EASignal_Type_" + magicStr, (double)StringGetTickCount(signalType));
       GlobalVariableSet("EASignal_Direction_" + magicStr, (double)StringGetTickCount(direction));
@@ -1956,31 +2081,45 @@ void SendHedgeSignal(string signalType, string direction, double volume, double 
             DoubleToString(volume, 2), " lots, TP: ", DoubleToString(tp, 5), 
             ", SL: ", DoubleToString(sl, 5));
    }
-   else
+   else // FILE_BASED
    {
-      // Use file-based communication
-
-      if(SignalFilePath=="")
-         SignalFilePath = TerminalInfoString(TERMINAL_COMMONDATA_PATH) + "\\Synergy_Signals.txt";
-
-      int fileHandle = FileOpen(SignalFilePath, FILE_WRITE|FILE_TXT);
+      // Create a signal string with all parameters
+      string signalData = signalType + "," + 
+                        direction + "," + 
+                        DoubleToString(volume, 2) + "," + 
+                        DoubleToString(tp, 5) + "," + 
+                        DoubleToString(sl, 5) + "," + 
+                        IntegerToString(Magic_Number) + "," +
+                        IntegerToString(TimeCurrent());
       
-      if(fileHandle != INVALID_HANDLE)
+      // Try to write the signal file with retries
+      bool success = false;
+      for(int attempt = 1; attempt <= FILE_WRITE_RETRY && !success; attempt++)
       {
-         string signalData = signalType + "," + 
-                             direction + "," + 
-                             DoubleToString(volume, 2) + "," + 
-                             DoubleToString(tp, 5) + "," + 
-                             DoubleToString(sl, 5) + "," + 
-                             IntegerToString(TimeCurrent());
-                             
-         FileWriteString(fileHandle, signalData);
-         FileClose(fileHandle);
-         Print("Signal file written to ", SignalFilePath);
+         int fileHandle = FileOpen(COMM_FILE_PATH, FILE_WRITE|FILE_COMMON);
+         if(fileHandle != INVALID_HANDLE)
+         {
+            FileWriteString(fileHandle, signalData);
+            FileClose(fileHandle);
+            success = true;
+            
+            Print("Signal sent to hedge EA via file: ", signalType, " ", direction, " ", 
+                  DoubleToString(volume, 2), " lots");
+         }
+         else
+         {
+            int errorCode = GetLastError();
+            Print("ERROR (attempt ", attempt, "): Failed to write signal file: ", errorCode);
+            
+            // Wait briefly before retry
+            Sleep(100);
+         }
       }
-      else
+      
+      if(!success)
       {
-         Print("Error opening signal file at ", SignalFilePath, ": ", GetLastError());
+         Print("CRITICAL ERROR: Failed to send signal to hedge EA after ", 
+               IntegerToString(FILE_WRITE_RETRY), " attempts!");
       }
    }
 }
