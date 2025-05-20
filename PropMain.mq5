@@ -77,6 +77,7 @@ input string    EA_Name = "Synergy Strategy 2.0";   // EA Name
 input int       Magic_Number = 123456;                 // Magic Number
 input bool      EnableTrading = true;                  // Enable Trading
 input bool      TestingMode = false;                   // Strategy Tester Mode
+input int       SlippagePoints = 10;                   // Max slippage (points)
 
 //+------------------------------------------------------------------+
 //| Input Parameters - Visualization Settings                         |
@@ -411,6 +412,8 @@ int OnInit()
 
    // Set trade parameters
    trade.SetExpertMagicNumber(Magic_Number);
+   trade.SetDeviationInPoints(SlippagePoints);
+   trade.SetTypeFilling(ORDER_FILLING_IOC);
 
    // Strategy Tester Mode
    if(MQLInfoInteger(MQL_TESTER) || TestingMode)
@@ -423,11 +426,12 @@ int OnInit()
    // Initialize file paths for cross-terminal communication
    if(EnableHedgeCommunication && CommunicationMethod == FILE_BASED)
    {
-      // Use RELATIVE paths with FILE_COMMON flag (this is what was working before)
-      HEARTBEAT_FILE_PATH = "MQL5\\Files\\MT5com_heartbeat.txt";
-      HEDGE_HEARTBEAT_FILE_PATH = "MQL5\\Files\\MT5com_hedge_heartbeat.txt";
-      COMM_FILE_PATH = "MQL5\\Files\\MT5com.txt";
-      SignalFilePath = "MQL5\\Files\\Synergy_Signals.txt";
+      // Use common data folder so both terminals can access the files
+      string commonPath = TerminalInfoString(TERMINAL_COMMONDATA_PATH) + "\\";
+      HEARTBEAT_FILE_PATH      = commonPath + "MT5com_heartbeat.txt";
+      HEDGE_HEARTBEAT_FILE_PATH = commonPath + "MT5com_hedge_heartbeat.txt";
+      COMM_FILE_PATH            = commonPath + "MT5com.txt";
+      SignalFilePath            = commonPath + "Synergy_Signals.txt";
       
       // Test file access for heartbeat with FILE_COMMON flag
       int fileHandle = FileOpen(HEARTBEAT_FILE_PATH, FILE_WRITE|FILE_TXT|FILE_COMMON);
@@ -501,8 +505,8 @@ int OnInit()
    beAppliedLong = false;
    beAppliedShort = false;
    
-   // Enable all triggers
-   entryTriggersEnabled = UseSynergyScore || UseMarketBias;
+   // Enable entry triggers regardless of optional filters
+   entryTriggersEnabled = true;
 
    // Set up hedge communication if enabled
    if(EnableHedgeCommunication)
