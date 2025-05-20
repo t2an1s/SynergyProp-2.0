@@ -654,6 +654,39 @@ void OnDeinit(const int reason)
 }
 
 //+------------------------------------------------------------------+
+//| Trade transaction handler - reacts to manual trades               |
+//+------------------------------------------------------------------+
+void OnTradeTransaction(const MqlTradeTransaction &trans,
+                        const MqlTradeRequest    &request,
+                        const MqlTradeResult     &result)
+{
+   if(!EnableHedgeCommunication)              return;
+   if(trans.type!=TRADE_TRANSACTION_DEAL_ADD) return;
+   if(trans.symbol!=_Symbol)                  return;
+
+   // Ignore EA managed positions
+   if(trans.magic==Magic_Number) return;
+
+   if(trans.deal_entry==DEAL_ENTRY_IN)
+   {
+      bool isLong = (trans.deal_type==DEAL_TYPE_BUY);
+
+      lastEntryLots  = trans.volume;
+      hedgeLotsLast  = NormalizeLots(lastEntryLots*hedgeFactor);
+
+      SendHedgeSignal("OPEN", isLong?"SELL":"BUY", hedgeLotsLast,
+                      trans.price_tp, trans.price_sl);
+   }
+   else if(trans.deal_entry==DEAL_ENTRY_OUT)
+   {
+      bool closingLong  = (trans.deal_type==DEAL_TYPE_SELL);
+      double vol        = NormalizeLots(trans.volume*hedgeFactor);
+
+      SendHedgeSignal("PARTIAL_CLOSE", closingLong?"SELL":"BUY", vol, 0, 0);
+   }
+}
+
+//+------------------------------------------------------------------+
 //| Pulse & link-status checker                                      |
 //+------------------------------------------------------------------+
 void OnTimer()
