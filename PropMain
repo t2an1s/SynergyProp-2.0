@@ -1,17 +1,18 @@
 //+------------------------------------------------------------------+
-//|                                       Synergy_Strategy_v1.01.mq5 |
+//|                                       Synergy_Strategy_v1.02.mq5 |
 //|  Streamlined Synergy Strategy + PropEA‑style Hedge Engine (port) |
 //|                                                                  |
-//|  CHANGE LOG (v1.01 – 18‑May‑2025)                                |
+//|  CHANGE LOG (v1.02 – 20‑May‑2025)                                |
 //|   • Added BARS_REQUIRED constant and warm‑up guard               |
 //|   • Robust history copying & buffer guards (no array overflow)   |
 //|   • Re‑implemented pivot‑scan functions with bounds checks       |
 //|   • Safe CopyBuffer calls with early return on incomplete data   |
 //|   • Hardened CalculateEMAValue & CalculateADXFilter              |
+//|   • Manual trades trigger hedge via OnTradeTransaction           |
 //+------------------------------------------------------------------+
 #property copyright "t2an1s"
 #property link      "http://www.yourwebsite.com"
-#property version   "1.01"
+#property version   "1.02"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -547,7 +548,7 @@ int OnInit()
    Print("HedgeEA_Magic = ", HedgeEA_Magic);
    Print("EnableHedgeCommunication = ", EnableHedgeCommunication ? "TRUE" : "FALSE");
    Print("CommunicationMethod = ", CommunicationMethod == GLOBAL_VARS ? "GLOBAL_VARS" : "FILE_BASED");
-   Print("Synergy Strategy v1.01 initialised. Hedge factor:",DoubleToString(hedgeFactor,4));
+   Print("Synergy Strategy v1.02 initialised. Hedge factor:",DoubleToString(hedgeFactor,4));
 
    return(INIT_SUCCEEDED);
 }
@@ -659,6 +660,39 @@ void OnDeinit(const int reason)
    }
    
    Print("Synergy Strategy stopped. Reason: ", GetUninitReasonText(reason));
+}
+
+//+------------------------------------------------------------------+
+//| Trade transaction handler - reacts to manual trades               |
+//+------------------------------------------------------------------+
+void OnTradeTransaction(const MqlTradeTransaction &trans,
+                        const MqlTradeRequest    &request,
+                        const MqlTradeResult     &result)
+{
+   if(!EnableHedgeCommunication)              return;
+   if(trans.type!=TRADE_TRANSACTION_DEAL_ADD) return;
+   if(trans.symbol!=_Symbol)                  return;
+
+   // Ignore EA managed positions
+   if(trans.magic==Magic_Number) return;
+
+   if(trans.deal_entry==DEAL_ENTRY_IN)
+   {
+      bool isLong = (trans.deal_type==DEAL_TYPE_BUY);
+
+      lastEntryLots  = trans.volume;
+      hedgeLotsLast  = NormalizeLots(lastEntryLots*hedgeFactor);
+
+      SendHedgeSignal("OPEN", isLong?"SELL":"BUY", hedgeLotsLast,
+                      trans.price_tp, trans.price_sl);
+   }
+   else if(trans.deal_entry==DEAL_ENTRY_OUT)
+   {
+      bool closingLong  = (trans.deal_type==DEAL_TYPE_SELL);
+      double vol        = NormalizeLots(trans.volume*hedgeFactor);
+
+      SendHedgeSignal("PARTIAL_CLOSE", closingLong?"SELL":"BUY", vol, 0, 0);
+   }
 }
 
 //+------------------------------------------------------------------+
