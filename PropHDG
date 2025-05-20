@@ -2,7 +2,11 @@
 //|                                                    PropEA_HDG.mq5 |
 //|   Prop‑style Hedge Engine (paired with Synergy Strategy v1.01)   |
 //|                                                                  |
-//|  CHANGE LOG (v2.04 – 20‑May‑2025)                                |
+//|  CHANGE LOG (v2.05 – 20‑May‑2025)                                |
+//|   • Fixed excessive logging to reduce Experts tab clutter       |
+//|   • Added LogVerbosity setting to control debug output          |
+//|   • Reduced frequency of routine status messages                |
+//|   • Only log important events: errors, signals, state changes   |
 //|   • Added bidirectional heartbeat / link‑monitor                |
 //|   • Dashboard shows "Hedge Link OK / NOT OK" status             |
 //|   • Debug prints on link loss / recovery                        |
@@ -13,7 +17,7 @@
 //+------------------------------------------------------------------+
 #property copyright "t2an1s"
 #property link      "http://www.yourwebsite.com"
-#property version   "2.04"
+#property version   "2.05"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -24,12 +28,14 @@ CTrade trade;
 //────────────────────────────────────────────────────────────────────
 
 enum ENUM_COMMUNICATION_METHOD { GLOBAL_VARS, FILE_BASED };
+enum ENUM_LOG_LEVEL { LOG_ERRORS_ONLY, LOG_IMPORTANT, LOG_VERBOSE };
 
 input group "General Settings"
 input string    EA_Name               = "PropEA Hedge";   // display only
 input int       Magic_Number          = 789123;            // must match hedgeMagic in prop EA
 input bool      EnableTrading         = true;
 input ENUM_COMMUNICATION_METHOD CommunicationMethod = FILE_BASED; // Use FILE_BASED for cross-account
+input ENUM_LOG_LEVEL LogVerbosity     = LOG_IMPORTANT;     // Control logging verbosity
 
 input group "Hedge Settings"
 input int       SourceEA_Magic        = 123456;            // magic of main strategy EA
@@ -68,7 +74,26 @@ const int FILE_WRITE_RETRY = 3;   // Number of retries for file operations
 const int FILE_CHECK_SECONDS = 5;  // How often to check for heartbeat
 
 //────────────────────────────────────────────────────────────────────
-// 3. HELPER – STRING HASH (shared with prop EA)
+// 3. LOGGING HELPERS
+//────────────────────────────────────────────────────────────────────
+void LogInfo(string message) {
+   if(LogVerbosity >= LOG_VERBOSE) Print(message);
+}
+
+void LogImportant(string message) {
+   if(LogVerbosity >= LOG_IMPORTANT) Print(message);
+}
+
+void LogError(string message) {
+   Print("ERROR: ", message); // Always log errors
+}
+
+void LogWarning(string message) {
+   if(LogVerbosity >= LOG_IMPORTANT) Print("WARNING: ", message);
+}
+
+//────────────────────────────────────────────────────────────────────
+// 4. HELPER – STRING HASH (shared with prop EA)
 //────────────────────────────────────────────────────────────────────
 ulong StringGetTickCount(string text)
 {
@@ -77,23 +102,22 @@ ulong StringGetTickCount(string text)
 }
 
 //────────────────────────────────────────────────────────────────────
-// 4. HEART‑BEAT HELPERS
+// 5. HEART‑BEAT HELPERS
 //────────────────────────────────────────────────────────────────────
 void SendHeartbeat()
 {
    if(CommunicationMethod == GLOBAL_VARS)
    {
-      // Original global variable code
       string name = "HEDGE_HB_" + IntegerToString(Magic_Number);
       double currentTime = (double)TimeCurrent();
       GlobalVariableSet(name, currentTime);
       lastPulseSent = (ulong)TimeCurrent();
       
-      // Periodically print debug info
-      static datetime lastPrintTime = 0;
-      if(TimeCurrent() - lastPrintTime > 60) {
-         Print("Hedge EA heartbeat sent: ", name, " = ", TimeToString((datetime)currentTime));
-         lastPrintTime = TimeCurrent();
+      // Only log heartbeat on startup or errors - remove periodic spam
+      static bool startupLogged = false;
+      if(!startupLogged) {
+         LogInfo("Hedge EA heartbeat initialized: " + name);
+         startupLogged = true;
       }
    }
    else // FILE_BASED
@@ -107,31 +131,22 @@ void SendHeartbeat()
          FileWriteString(fileHandle, heartbeatData);
          FileClose(fileHandle);
          
-         // Report success with lower frequency to avoid log spam
-         static datetime lastReport = 0;
-         if(TimeCurrent() - lastReport > 60) {  // Report once per minute
-            Print("Hedge EA heartbeat sent to file: ", HEARTBEAT_FILE_PATH);
-            
-            // VERIFY the file was actually created
-            if(FileIsExist(HEARTBEAT_FILE_PATH, FILE_COMMON)) {
-               Print("VERIFICATION: Heartbeat file exists and is accessible");
-            } else {
-               Print("ERROR: Heartbeat file was not created or is not accessible");
-            }
-            
-            lastReport = TimeCurrent();
+         // Only report file creation once at startup
+         static bool fileHeartbeatLogged = false;
+         if(!fileHeartbeatLogged) {
+            LogInfo("File-based heartbeat initialized: " + HEARTBEAT_FILE_PATH);
+            fileHeartbeatLogged = true;
          }
       }
       else
       {
          int errorCode = GetLastError();
          static datetime lastErrorReport = 0;
-         if(TimeCurrent() - lastErrorReport > 30) {  // Report errors every 30 seconds
-            Print("ERROR: Failed to write heartbeat file: ", errorCode, " - ", 
-                  errorCode == 5002 ? "Cannot create file (permissions?)" :
-                  errorCode == 4103 ? "Invalid path" : 
-                  errorCode == 5004 ? "No disk space" : "File error");
-            Print("Attempted path: ", HEARTBEAT_FILE_PATH);
+         if(TimeCurrent() - lastErrorReport > 300) {  // Report errors every 5 minutes instead of 30 seconds
+            LogError("Failed to write heartbeat file: " + IntegerToString(errorCode) + " - " + 
+                  (errorCode == 5002 ? "Cannot create file (permissions?)" :
+                   errorCode == 4103 ? "Invalid path" : 
+                   errorCode == 5004 ? "No disk space" : "File error"));
             lastErrorReport = TimeCurrent();
          }
       }
@@ -144,43 +159,43 @@ bool IsLinkAlive()
 {
    if(CommunicationMethod == GLOBAL_VARS)
    {
-      // Original global variable code (unchanged)
       string peer = "PROP_HB_" + IntegerToString(SourceEA_Magic);
       
       if(!GlobalVariableCheck(peer)) {
          static datetime lastErrorTime = 0;
-         if(TimeCurrent() - lastErrorTime > 30) {
-            Print("ERROR: Main EA heartbeat not found: ", peer);
+         if(TimeCurrent() - lastErrorTime > 300) { // Reduce frequency to 5 minutes
+            LogWarning("Main EA heartbeat not found: " + peer);
             lastErrorTime = TimeCurrent();
          }
          return false;
       }
       
       double ts = GlobalVariableGet(peer);
-      bool isAlive = ((TimeCurrent() - (datetime)ts) <= LINK_TIMEOUT_SEC);
+      // calculate age using long to avoid uint cast warning
+      long ageSecondsGV = TimeCurrent() - (datetime)ts;
+      bool isAlive = ageSecondsGV <= LINK_TIMEOUT_SEC;
       
-      // Log status
-      static bool wasAlive = false;
-      static datetime lastStatusTime = 0;
+      // Only log when status changes, not periodically
+      static bool wasAlive = true; // Assume alive at start
+      static bool firstCheck = true;
       
-      if(isAlive != wasAlive || TimeCurrent() - lastStatusTime > 60) {
-         Print("Main EA link status: ", isAlive ? "ALIVE" : "DEAD", 
-               " (Last beat: ", TimeToString((datetime)ts), 
-               ", Age: ", TimeCurrent() - (datetime)ts, "s)");
-         lastStatusTime = TimeCurrent();
+      if(isAlive != wasAlive || firstCheck) {
+         LogImportant("Main EA link status: " + (isAlive ? "ALIVE" : "DEAD") + 
+               " (Last beat: " + TimeToString((datetime)ts) + 
+               ", Age: " + IntegerToString((int)ageSecondsGV) + "s)");
          wasAlive = isAlive;
+         firstCheck = false;
       }
       
       return isAlive;
    }
    else // FILE_BASED
    {
-      // Try to read main EA's heartbeat file
       if(!FileIsExist(MAIN_HEARTBEAT_FILE_PATH, FILE_COMMON))
       {
          static datetime lastErrorReport = 0;
-         if(TimeCurrent() - lastErrorReport > 30) {
-            Print("WARNING: Main EA heartbeat file not found: ", MAIN_HEARTBEAT_FILE_PATH);
+         if(TimeCurrent() - lastErrorReport > 300) { // Reduce frequency to 5 minutes
+            LogWarning("Main EA heartbeat file not found: " + MAIN_HEARTBEAT_FILE_PATH);
             lastErrorReport = TimeCurrent();
          }
          return false;
@@ -189,15 +204,19 @@ bool IsLinkAlive()
       int fileHandle = FileOpen(MAIN_HEARTBEAT_FILE_PATH, FILE_READ|FILE_TXT|FILE_COMMON);
       if(fileHandle == INVALID_HANDLE)
       {
-         Print("ERROR: Unable to open main heartbeat file. Error: ", GetLastError());
+         static datetime lastErrorReport = 0;
+         if(TimeCurrent() - lastErrorReport > 60) {
+            LogError("Unable to open main heartbeat file. Error: " + IntegerToString(GetLastError()));
+            lastErrorReport = TimeCurrent();
+         }
          return false;
       }
       
       string content = FileReadString(fileHandle);
       FileClose(fileHandle);
       
-      // Debug: Print what we read from file
-      Print("DEBUG: Read from main file: ", content);
+      // Only log content in verbose mode
+      LogInfo("Read from main file: " + content);
       
       // Parse heartbeat data: format is MAIN_HEARTBEAT,magicnumber,timestamp
       string parts[];
@@ -206,8 +225,12 @@ bool IsLinkAlive()
       // Check if magic number matches
       if(parts[1] != IntegerToString(SourceEA_Magic))
       {
-         Print("ERROR: Main heartbeat has incorrect magic number: ", parts[1], 
-               " expected: ", SourceEA_Magic);
+         static datetime lastMagicError = 0;
+         if(TimeCurrent() - lastMagicError > 300) {
+            LogError("Main heartbeat has incorrect magic number: " + parts[1] + 
+                  " expected: " + IntegerToString(SourceEA_Magic));
+            lastMagicError = TimeCurrent();
+         }
          return false;
       }
       
@@ -219,47 +242,49 @@ bool IsLinkAlive()
          
          if(heartbeatTime > 0)
          {
-            int ageSeconds = (int)(TimeCurrent() - heartbeatTime);  // Cast to int for proper display
+            int ageSeconds = (int)(TimeCurrent() - heartbeatTime);
             bool isAlive = ageSeconds <= LINK_TIMEOUT_SEC;
             
-            // Log status periodically
-            static bool wasAlive = false;
-            static datetime lastStatusLog = 0;
+            // Only log when status changes
+            static bool wasAlive = true;
+            static bool firstCheck = true;
             
-            if(isAlive != wasAlive || TimeCurrent() - lastStatusLog > 60)
+            if(isAlive != wasAlive || firstCheck)
             {
-               Print("Main EA link status: ", isAlive ? "ALIVE" : "DEAD", 
-                     " (Last heartbeat: ", TimeToString(heartbeatTime), 
-                     ", Age: ", ageSeconds, "s)");
-               lastStatusLog = TimeCurrent();
+               LogImportant("Main EA link status: " + (isAlive ? "ALIVE" : "DEAD") + 
+                     " (Last heartbeat: " + TimeToString(heartbeatTime) + 
+                     ", Age: " + IntegerToString((int)ageSeconds) + "s)");
                wasAlive = isAlive;
+               firstCheck = false;
             }
             
             return isAlive;
          }
          else
          {
-            Print("ERROR: Invalid timestamp value: ", timestampString, " parsed as ", heartbeatTime);
+            LogError("Invalid timestamp value: " + timestampString + " parsed as " + IntegerToString(heartbeatTime));
             return false;
          }
       }
       else
       {
-         Print("ERROR: Empty timestamp string in heartbeat");
+         LogError("Empty timestamp string in heartbeat");
          return false;
       }
    }
 }
 
 //────────────────────────────────────────────────────────────────────
-// 5. INIT / DEINIT
+// 6. INIT / DEINIT
 //────────────────────────────────────────────────────────────────────
 int OnInit()
 {
-   Print("===== HEDGE EA STARTUP =====");
+   Print("===== HEDGE EA STARTUP v2.05 =====");
    Print("Magic_Number: ", Magic_Number);
    Print("SourceEA_Magic: ", SourceEA_Magic);
    Print("CommunicationMethod: ", CommunicationMethod == GLOBAL_VARS ? "GLOBAL_VARS" : "FILE_BASED");
+   Print("LogVerbosity: ", LogVerbosity == LOG_ERRORS_ONLY ? "ERRORS_ONLY" : 
+                           LogVerbosity == LOG_IMPORTANT ? "IMPORTANT" : "VERBOSE");
    
    trade.SetExpertMagicNumber(Magic_Number);
    initialBalance = AccountInfoDouble(ACCOUNT_BALANCE);
@@ -274,41 +299,38 @@ int OnInit()
       // Verify the heartbeat was set
       if(GlobalVariableCheck(heartbeatName)) {
          double checkValue = GlobalVariableGet(heartbeatName);
-         Print("HEDGE HEARTBEAT VERIFICATION: Variable ", heartbeatName, " = ", TimeToString((datetime)checkValue));
+         LogImportant("HEDGE HEARTBEAT VERIFIED: Variable " + heartbeatName + " = " + TimeToString((datetime)checkValue));
       } else {
-         Print("!!! ERROR: Failed to set hedge heartbeat global variable: ", heartbeatName);
+         LogError("Failed to set hedge heartbeat global variable: " + heartbeatName);
       }
       
       // Check if we can find the main EA's heartbeat
       string mainHeartbeat = "PROP_HB_" + IntegerToString(SourceEA_Magic);
       if(GlobalVariableCheck(mainHeartbeat)) {
          double mainValue = GlobalVariableGet(mainHeartbeat);
-         Print("MAIN EA HEARTBEAT FOUND: ", mainHeartbeat, " = ", TimeToString((datetime)mainValue));
+         LogImportant("MAIN EA HEARTBEAT FOUND: " + mainHeartbeat + " = " + TimeToString((datetime)mainValue));
       } else {
-         Print("!!! ERROR: Main EA heartbeat not found: ", mainHeartbeat);
-         Print("Is the Main EA running? Is its Magic Number set correctly to ", SourceEA_Magic, "?");
+         LogError("Main EA heartbeat not found: " + mainHeartbeat);
+         LogError("Is the Main EA running? Is its Magic Number set correctly to " + IntegerToString(SourceEA_Magic) + "?");
       }
       
-      // Dump all existing global variables
-      Print("--- ALL GLOBAL VARIABLES AT STARTUP ---");
-      for(int i=0; i<GlobalVariablesTotal(); i++) {
-         string name = GlobalVariableName(i);
-         double value = GlobalVariableGet(name);
-         Print(i, ": ", name, " = ", value, " (time: ", TimeToString((datetime)value), ")");
+      // Only dump variables in verbose mode
+      if(LogVerbosity >= LOG_VERBOSE) {
+         Print("--- ALL GLOBAL VARIABLES AT STARTUP ---");
+         for(int i=0; i<GlobalVariablesTotal(); i++) {
+            string name = GlobalVariableName(i);
+            double value = GlobalVariableGet(name);
+            Print(i, ": ", name, " = ", value, " (time: ", TimeToString((datetime)value), ")");
+         }
+         Print("--------------------------------------");
       }
-      Print("--------------------------------------");
    }
    else // FILE_BASED mode
    {
-      // Use RELATIVE paths with FILE_COMMON flag (this is what works for cross-terminal access)
-      HEARTBEAT_FILE_PATH = "MQL5\\Files\\MT5com_hedge_heartbeat.txt";
-      MAIN_HEARTBEAT_FILE_PATH = "MQL5\\Files\\MT5com_heartbeat.txt";
-      COMM_FILE_PATH = "MQL5\\Files\\MT5com.txt";
-      
-      Print("File-based communication paths:");
-      Print("- Hedge heartbeat: ", HEARTBEAT_FILE_PATH);
-      Print("- Main heartbeat: ", MAIN_HEARTBEAT_FILE_PATH);
-      Print("- Signal file: ", COMM_FILE_PATH);
+      LogImportant("File-based communication paths:");
+      LogImportant("- Hedge heartbeat: " + HEARTBEAT_FILE_PATH);
+      LogImportant("- Main heartbeat: " + MAIN_HEARTBEAT_FILE_PATH);
+      LogImportant("- Signal file: " + COMM_FILE_PATH);
       
       // Test file access for heartbeat with FILE_COMMON flag
       int fileHandle = FileOpen(HEARTBEAT_FILE_PATH, FILE_WRITE|FILE_TXT|FILE_COMMON);
@@ -317,21 +339,20 @@ int OnInit()
          FileWriteString(fileHandle, "HEDGE_HEARTBEAT," + IntegerToString(Magic_Number) + "," + 
                         IntegerToString(TimeCurrent()));
          FileClose(fileHandle);
-         Print("File-based hedge communication initialized. Magic: ", Magic_Number);
+         LogImportant("File-based hedge communication initialized. Magic: " + IntegerToString(Magic_Number));
       }
       else
       {
          int errorCode = GetLastError();
-         Print("WARNING: Failed to create heartbeat file: ", errorCode, " - ", 
-               errorCode == 5002 ? "Cannot create file (permissions?)" :
-               errorCode == 4103 ? "Invalid path" : "File error");
-         Print("File path attempted: ", HEARTBEAT_FILE_PATH);
-         Print("EA will continue but file communication may not work properly");
-         // Don't fail initialization - continue anyway
+         LogError("Failed to create heartbeat file: " + IntegerToString(errorCode) + " - " + 
+               (errorCode == 5002 ? "Cannot create file (permissions?)" :
+                errorCode == 4103 ? "Invalid path" : "File error"));
+         LogError("File path attempted: " + HEARTBEAT_FILE_PATH);
+         LogWarning("EA will continue but file communication may not work properly");
       }
    }
    
-   // Start heartbeat timer with shorter interval for immediate feedback
+   // Start heartbeat timer
    EventSetTimer(2); // Check every 2 seconds initially
    SendHeartbeat();
    linkWasOK = IsLinkAlive();
@@ -347,29 +368,16 @@ void OnDeinit(const int reason)
    
    // Clean up files in file-based mode
    if(CommunicationMethod == FILE_BASED) {
-      // Use absolute path for cleanup
       string commonPath = TerminalInfoString(TERMINAL_COMMONDATA_PATH) + "\\MQL5\\Files";
       string heartbeatFile = commonPath + "\\MT5com_hedge_heartbeat.txt";
-      string signalFile    = commonPath + "\\MT5com.txt";
-
-      // Check if file exists using direct path
+      
       int fileHandle = FileOpen(heartbeatFile, FILE_READ|FILE_TXT);
       if(fileHandle != INVALID_HANDLE) {
          FileClose(fileHandle);
          if(FileDelete(heartbeatFile)) {
-            Print("Deleted hedge heartbeat file: ", heartbeatFile);
+            LogInfo("Deleted hedge heartbeat file: " + heartbeatFile);
          } else {
-            Print("Failed to delete hedge heartbeat file: ", GetLastError());
-         }
-      }
-
-      fileHandle = FileOpen(signalFile, FILE_READ|FILE_TXT);
-      if(fileHandle != INVALID_HANDLE) {
-         FileClose(fileHandle);
-         if(FileDelete(signalFile)) {
-            Print("Deleted signal file: ", signalFile);
-         } else {
-            Print("Failed to delete signal file: ", GetLastError());
+            LogWarning("Failed to delete heartbeat file: " + IntegerToString(GetLastError()));
          }
       }
    }
@@ -378,7 +386,7 @@ void OnDeinit(const int reason)
 }
 
 //────────────────────────────────────────────────────────────────────
-// 6. TIMER – pulse & link monitor
+// 7. TIMER – pulse & link monitor
 //────────────────────────────────────────────────────────────────────
 void OnTimer()
 {
@@ -387,52 +395,39 @@ void OnTimer()
    // Send heartbeat
    SendHeartbeat();
    
-   // For the first few timer ticks, check more frequently with detailed logs
-   if(timerCount < 10) {
+   // Reduced startup debugging - only first 3 ticks instead of 10
+   if(timerCount <= 3 && LogVerbosity >= LOG_VERBOSE) {
       if(CommunicationMethod == GLOBAL_VARS) {
-         // Original global variable debug
          string heartbeatName = "HEDGE_HB_" + IntegerToString(Magic_Number);
-         double currentTime = (double)TimeCurrent();
+         LogInfo("STARTUP DEBUG [" + IntegerToString(timerCount) + "]: Heartbeat " + heartbeatName + " sent");
          
-         Print("HEDGE HEARTBEAT DEBUG [", timerCount, "]: Set ", heartbeatName, " = ", TimeToString((datetime)currentTime));
-         
-         // Verify immediately after setting
-         if(GlobalVariableCheck(heartbeatName)) {
-            double checkValue = GlobalVariableGet(heartbeatName);
-            Print("  → Verification: ", heartbeatName, " = ", TimeToString((datetime)checkValue));
-         } else {
-            Print("  !!! ERROR: Variable not found immediately after setting!");
-         }
-         
-         // Check for main EA heartbeat
          string mainHeartbeat = "PROP_HB_" + IntegerToString(SourceEA_Magic);
          if(GlobalVariableCheck(mainHeartbeat)) {
-            double mainValue = GlobalVariableGet(mainHeartbeat);
-            Print("  → Main EA heartbeat: ", mainHeartbeat, " = ", TimeToString((datetime)mainValue));
+            LogInfo("  → Main EA heartbeat found: " + mainHeartbeat);
          } else {
-            Print("  !!! Main EA heartbeat still not found: ", mainHeartbeat);
+            LogInfo("  → Main EA heartbeat missing: " + mainHeartbeat);
          }
       }
-      else { // FILE_BASED debug
-         Print("HEDGE HEARTBEAT DEBUG [", timerCount, "]: Checking files");
-         Print("  → My heartbeat file exists: ", FileIsExist(HEARTBEAT_FILE_PATH, FILE_COMMON) ? "YES" : "NO");
-         Print("  → Main heartbeat file exists: ", FileIsExist(MAIN_HEARTBEAT_FILE_PATH, FILE_COMMON) ? "YES" : "NO");
+      else {
+         LogInfo("STARTUP DEBUG [" + IntegerToString(timerCount) + "]: File heartbeat sent");
+         LogInfo("  → My file exists: " + (FileIsExist(HEARTBEAT_FILE_PATH, FILE_COMMON) ? "YES" : "NO"));
+         LogInfo("  → Main file exists: " + (FileIsExist(MAIN_HEARTBEAT_FILE_PATH, FILE_COMMON) ? "YES" : "NO"));
       }
    } 
-   // After 10 ticks, switch to normal heartbeat interval
-   else if(timerCount == 10) {
+   // After 3 ticks, switch to normal heartbeat interval
+   else if(timerCount == 4) {
       EventKillTimer();
       EventSetTimer(HEARTBEAT_SEC);
-      Print("Switching to normal heartbeat interval of ", HEARTBEAT_SEC, " seconds");
+      LogInfo("Switching to normal heartbeat interval of " + IntegerToString(HEARTBEAT_SEC) + " seconds");
    }
    
-   // Check link status
+   // Check link status - only log changes
    bool ok = IsLinkAlive();
    if(ok != linkWasOK) {
-      Print("Main EA link is now ", ok ? "OK ✅" : "NOT OK ❌");
+      LogImportant("Main EA link is now " + (ok ? "OK ✅" : "NOT OK ❌"));
       
-      // When link status changes in global vars mode, print variables
-      if(CommunicationMethod == GLOBAL_VARS) {
+      // Only dump variables in verbose mode and on link changes
+      if(CommunicationMethod == GLOBAL_VARS && LogVerbosity >= LOG_VERBOSE) {
          Print("--- GLOBAL VARIABLES AT LINK STATUS CHANGE ---");
          for(int i=0; i<GlobalVariablesTotal(); i++) {
             string name = GlobalVariableName(i);
@@ -447,7 +442,7 @@ void OnTimer()
 }
 
 //────────────────────────────────────────────────────────────────────
-// 7. ONTICK MAIN LOOP
+// 8. ONTICK MAIN LOOP
 //────────────────────────────────────────────────────────────────────
 void OnTick()
 {
@@ -455,9 +450,9 @@ void OnTick()
 
    UpdateDashboard();
 
-   // Print status in Experts tab every minute
+   // Greatly reduced status logging - only every 10 minutes instead of 1 minute
    static datetime lastTickLog = 0;
-   if(TimeCurrent() - lastTickLog > 60) {
+   if(TimeCurrent() - lastTickLog > 600 && LogVerbosity >= LOG_VERBOSE) {
       if(CommunicationMethod == GLOBAL_VARS) {
          string peerHB = "PROP_HB_" + IntegerToString(SourceEA_Magic);
          string myHB = "HEDGE_HB_" + IntegerToString(Magic_Number);
@@ -465,12 +460,12 @@ void OnTick()
          string peerStatus = GlobalVariableCheck(peerHB) ? "FOUND" : "NOT FOUND";
          string myStatus = GlobalVariableCheck(myHB) ? "FOUND" : "NOT FOUND";
          
-         Print("HEDGE EA STATUS: My heartbeat (", myHB, "): ", myStatus, 
-               ", Main EA heartbeat (", peerHB, "): ", peerStatus);
+         LogInfo("HEDGE EA STATUS: My heartbeat (" + myHB + "): " + myStatus + 
+               ", Main EA heartbeat (" + peerHB + "): " + peerStatus);
       }
-      else { // FILE_BASED
-         Print("HEDGE EA STATUS: My heartbeat file: ", FileIsExist(HEARTBEAT_FILE_PATH, FILE_COMMON) ? "EXISTS" : "MISSING", 
-               ", Main heartbeat file: ", FileIsExist(MAIN_HEARTBEAT_FILE_PATH, FILE_COMMON) ? "EXISTS" : "MISSING");
+      else {
+         LogInfo("HEDGE EA STATUS: My heartbeat file: " + (FileIsExist(HEARTBEAT_FILE_PATH, FILE_COMMON) ? "EXISTS" : "MISSING") + 
+               ", Main heartbeat file: " + (FileIsExist(MAIN_HEARTBEAT_FILE_PATH, FILE_COMMON) ? "EXISTS" : "MISSING"));
       }
       
       lastTickLog = TimeCurrent();
@@ -480,8 +475,8 @@ void OnTick()
    bool linkStatus = IsLinkAlive();
    if(!linkStatus) {
       static datetime lastLinkWarning = 0;
-      if(TimeCurrent() - lastLinkWarning > 60) {
-         Print("WARNING: Main EA link is DOWN. Hedge operations paused.");
+      if(TimeCurrent() - lastLinkWarning > 300) { // Reduce warning frequency to 5 minutes
+         LogWarning("Main EA link is DOWN. Hedge operations paused.");
          lastLinkWarning = TimeCurrent();
       }
       return;
@@ -492,7 +487,7 @@ void OnTick()
 }
 
 //────────────────────────────────────────────────────────────────────
-// 8. COMMUNICATION LAYER (read signals)
+// 9. COMMUNICATION LAYER (read signals)
 //────────────────────────────────────────────────────────────────────
 
 void ProcessSignal(string signalType,string direction,double volume,double tp,double sl); // fwd decl
@@ -504,11 +499,11 @@ void CheckForHedgeSignals()
       string base = IntegerToString(SourceEA_Magic);
       string signalTimeVar = "EASignal_Time_" + base;
       
-      // Periodically check if key variables exist (every minute)
+      // Reduce variable check frequency to every 5 minutes in verbose mode only
       static datetime lastCheckTime = 0;
-      if(TimeCurrent() - lastCheckTime > 60) {
+      if(TimeCurrent() - lastCheckTime > 300 && LogVerbosity >= LOG_VERBOSE) {
          if(!GlobalVariableCheck(signalTimeVar)) {
-            Print("INFO: Signal variable not found: ", signalTimeVar, " (this is normal if no signals have been sent)");
+            LogInfo("Signal variable not found: " + signalTimeVar + " (normal if no signals sent)");
          }
          lastCheckTime = TimeCurrent();
       }
@@ -530,38 +525,33 @@ void CheckForHedgeSignals()
       else if(typeCode == StringGetTickCount("MODIFY")) sType = "MODIFY";
       else if(typeCode == StringGetTickCount("PARTIAL_CLOSE")) sType = "PARTIAL_CLOSE";
       else if(typeCode == StringGetTickCount("BLEED")) sType = "BLEED";
-      else Print("WARNING: Unknown signal type code: ", typeCode);
+      else LogWarning("Unknown signal type code: " + IntegerToString(typeCode));
 
       if(dirCode == StringGetTickCount("BUY")) dir = "BUY";
       else if(dirCode == StringGetTickCount("SELL")) dir = "SELL";
-      else Print("WARNING: Unknown direction code: ", dirCode);
+      else LogWarning("Unknown direction code: " + IntegerToString(dirCode));
 
       if(sType != "" && dir != "") {
-         Print("Signal received: ", sType, " ", dir, " ", DoubleToString(vol, 2), 
-               " lots, TP: ", DoubleToString(tp, 5), ", SL: ", DoubleToString(sl, 5));
+         LogImportant("Signal received: " + sType + " " + dir + " " + DoubleToString(vol, 2) + 
+               " lots, TP: " + DoubleToString(tp, 5) + ", SL: " + DoubleToString(sl, 5));
          ProcessSignal(sType, dir, vol, tp, sl);
       } else {
-         Print("WARNING: Invalid signal - Type: ", sType, ", Direction: ", dir);
+         LogWarning("Invalid signal - Type: " + sType + ", Direction: " + dir);
       }
 
       last = sigTime;
    }
    else // FILE_BASED
    {
-      // Check if signal file exists - ADDED FILE_COMMON FLAG
-      if(!FileIsExist(COMM_FILE_PATH, FILE_COMMON))
-      {
-         return;
-      }
+      if(!FileIsExist(COMM_FILE_PATH, FILE_COMMON)) return;
       
-      // Try to open and read signal file - ADDED FILE_COMMON FLAG
       int fileHandle = FileOpen(COMM_FILE_PATH, FILE_READ|FILE_TXT|FILE_COMMON);
       if(fileHandle == INVALID_HANDLE)
       {
          static datetime lastErrorReport = 0;
-         if(TimeCurrent() - lastErrorReport > 30)
+         if(TimeCurrent() - lastErrorReport > 60)
          {
-            Print("ERROR: Unable to open signal file. Error: ", GetLastError());
+            LogError("Unable to open signal file. Error: " + IntegerToString(GetLastError()));
             lastErrorReport = TimeCurrent();
          }
          return;
@@ -570,10 +560,9 @@ void CheckForHedgeSignals()
       string content = FileReadString(fileHandle);
       FileClose(fileHandle);
       
-      // After reading, delete the file to prevent reprocessing - ADDED FILE_COMMON FLAG
       if(!FileDelete(COMM_FILE_PATH, FILE_COMMON))
       {
-         Print("WARNING: Failed to delete signal file after reading. Error: ", GetLastError());
+         LogWarning("Failed to delete signal file after reading. Error: " + IntegerToString(GetLastError()));
       }
       
       // Process signal data - format: signalType,direction,volume,tp,sl,magicNumber,timestamp
@@ -582,7 +571,7 @@ void CheckForHedgeSignals()
       
       if(count < 7)
       {
-         Print("ERROR: Invalid signal format: ", content);
+         LogError("Invalid signal format: " + content);
          return;
       }
       
@@ -594,92 +583,334 @@ void CheckForHedgeSignals()
       int magicNumber = (int)StringToInteger(parts[5]);
       datetime signalTime = (datetime)StringToInteger(parts[6]);
       
-      // Check if magic number matches expected source
       if(magicNumber != SourceEA_Magic)
       {
-         Print("WARNING: Received signal with unexpected magic number: ", magicNumber, 
-               " expected: ", SourceEA_Magic);
+         LogWarning("Received signal with unexpected magic number: " + IntegerToString(magicNumber) + 
+               " expected: " + IntegerToString(SourceEA_Magic));
          return;
       }
       
-      // Check if signal is too old
-      if(TimeCurrent() - signalTime > 60) // Signal older than 1 minute
+      if(TimeCurrent() - signalTime > 60)
       {
-         Print("WARNING: Ignoring old signal from ", TimeToString(signalTime));
+         LogWarning("Ignoring old signal from " + TimeToString(signalTime));
          return;
       }
       
-      Print("Signal received: ", signalType, " ", direction, " ", 
-            DoubleToString(volume, 2), " lots, TP: ", DoubleToString(tp, 5), 
-            ", SL: ", DoubleToString(sl, 5));
+      LogImportant("Signal received: " + signalType + " " + direction + " " + 
+            DoubleToString(volume, 2) + " lots, TP: " + DoubleToString(tp, 5) + 
+            ", SL: " + DoubleToString(sl, 5));
       
-      // Process the signal
       ProcessSignal(signalType, direction, volume, tp, sl);
    }
 }
 
 //────────────────────────────────────────────────────────────────────
-// 9. EXECUTE/UPDATE/CLOSE TRADES
+// 10. EXECUTE/UPDATE/CLOSE TRADES
 //────────────────────────────────────────────────────────────────────
-void ProcessSignal(string signalType,string direction,double volume,double tp,double sl)
+
+string GetRetcodeDescription(int retcode)
 {
-   if(volume<MinimumLot && volume>0) volume=MinimumLot;
-
-   if(signalType=="OPEN")
+   switch(retcode)
    {
-      bool ok=false;
-      if(direction=="BUY" && volume>0)
-         ok=trade.Buy(volume,_Symbol,0,sl,tp,"Hedge");
-      else if(direction=="SELL"&& volume>0)
-         ok=trade.Sell(volume,_Symbol,0,sl,tp,"Hedge");
-
-      int ret=trade.ResultRetcode();
-      if(!ok)
-         Print("ERROR: Hedge OPEN failed retcode ",ret,
-               " err=",GetLastError());
-      else
-         Print("Hedge OPEN ",direction," ",DoubleToString(volume,2),
-               " ret=",ret);
-   }
-   else if(signalType=="MODIFY")
-   {
-      for(int i=0;i<PositionsTotal();i++)
-         if(PositionSelectByTicket(PositionGetTicket(i)))
-            if(PositionGetInteger(POSITION_MAGIC)==Magic_Number && PositionGetString(POSITION_SYMBOL)==_Symbol)
-            {
-               trade.PositionModify(PositionGetTicket(i),sl,tp);
-               Print("Hedge MODIFY SL/TP");
-               break;
-            }
-   }
-   else if((signalType=="PARTIAL_CLOSE"||signalType=="BLEED") && volume>0)
-   {
-      for(int i=0;i<PositionsTotal();i++)
-         if(PositionSelectByTicket(PositionGetTicket(i)))
-            if(PositionGetInteger(POSITION_MAGIC)==Magic_Number && PositionGetString(POSITION_SYMBOL)==_Symbol)
-            {
-               trade.PositionClosePartial(PositionGetTicket(i),volume);
-               Print("Hedge ",signalType," closed ",DoubleToString(volume,2));
-               if(signalType=="BLEED") bleedDone=true;
-               break;
-            }
+      case 10004: return "TRADE_RETCODE_REQUOTE - Requote";
+      case 10006: return "TRADE_RETCODE_REJECT - Request rejected";
+      case 10007: return "TRADE_RETCODE_CANCEL - Request canceled";
+      case 10008: return "TRADE_RETCODE_PLACED - Order placed";
+      case 10009: return "TRADE_RETCODE_DONE - Request completed";
+      case 10010: return "TRADE_RETCODE_DONE_PARTIAL - Request completed partially";
+      case 10011: return "TRADE_RETCODE_ERROR - Request processing error";
+      case 10012: return "TRADE_RETCODE_TIMEOUT - Request timeout";
+      case 10013: return "TRADE_RETCODE_INVALID - Invalid request";
+      case 10014: return "TRADE_RETCODE_INVALID_VOLUME - Invalid volume";
+      case 10015: return "TRADE_RETCODE_INVALID_PRICE - Invalid price";
+      case 10016: return "TRADE_RETCODE_INVALID_STOPS - Invalid stops";
+      case 10017: return "TRADE_RETCODE_TRADE_DISABLED - Trade disabled";
+      case 10018: return "TRADE_RETCODE_MARKET_CLOSED - Market closed";
+      case 10019: return "TRADE_RETCODE_NO_MONEY - Not enough money";
+      case 10020: return "TRADE_RETCODE_PRICE_CHANGED - Price changed";
+      case 10021: return "TRADE_RETCODE_PRICE_OFF - Price off";
+      case 10022: return "TRADE_RETCODE_INVALID_EXPIRATION - Invalid expiration";
+      case 10023: return "TRADE_RETCODE_ORDER_CHANGED - Order changed";
+      case 10024: return "TRADE_RETCODE_TOO_MANY_REQUESTS - Too many requests";
+      case 10025: return "TRADE_RETCODE_NO_CHANGES - No changes";
+      case 10026: return "TRADE_RETCODE_SERVER_DISABLES_AT - Server disables AT";
+      case 10027: return "TRADE_RETCODE_CLIENT_DISABLES_AT - Client disables AT";
+      case 10028: return "TRADE_RETCODE_LOCKED - Request locked";
+      case 10029: return "TRADE_RETCODE_FROZEN - Order frozen";
+      case 10030: return "TRADE_RETCODE_INVALID_FILL - Invalid fill";
+      case 10031: return "TRADE_RETCODE_CONNECTION - No connection";
+      case 10032: return "TRADE_RETCODE_ONLY_REAL - Only real accounts";
+      case 10033: return "TRADE_RETCODE_LIMIT_ORDERS - Order limit reached";
+      case 10034: return "TRADE_RETCODE_LIMIT_VOLUME - Volume limit reached";
+      case 10035: return "TRADE_RETCODE_INVALID_ORDER - Invalid order";
+      case 10036: return "TRADE_RETCODE_POSITION_CLOSED - Position closed";
+      default: return "Unknown retcode: " + IntegerToString(retcode);
    }
 }
 
-// simple housekeeping print (optional)
+bool ValidateTradeParameters(string direction, double volume, double sl, double tp)
+{
+   // Check if market is open
+   if(!SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE))
+   {
+      LogError("Trading is disabled for " + _Symbol);
+      return false;
+   }
+   
+   // Get symbol specifications
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   
+   // Validate volume
+   if(volume < minLot)
+   {
+      LogError("Volume too small: " + DoubleToString(volume, 2) + " < min: " + DoubleToString(minLot, 2));
+      return false;
+   }
+   
+   if(volume > maxLot)
+   {
+      LogError("Volume too large: " + DoubleToString(volume, 2) + " > max: " + DoubleToString(maxLot, 2));
+      return false;
+   }
+   
+   // Normalize volume to lot step
+   double normalizedVolume = MathRound(volume / lotStep) * lotStep;
+   if(MathAbs(volume - normalizedVolume) > 0.0001)
+   {
+      LogWarning("Volume adjusted from " + DoubleToString(volume, 2) + " to " + DoubleToString(normalizedVolume, 2));
+   }
+   
+   // Check account margin
+   if(AccountInfoInteger(ACCOUNT_TRADE_ALLOWED) == false)
+   {
+      LogError("Trading is not allowed for this account");
+      return false;
+   }
+   
+   // Check if we have enough margin
+   double requiredMargin = 0;
+   if(direction == "BUY")
+   {
+      if(!OrderCalcMargin(ORDER_TYPE_BUY, _Symbol, volume, SymbolInfoDouble(_Symbol, SYMBOL_ASK), requiredMargin))
+      {
+         LogError("Cannot calculate margin for BUY order");
+         return false;
+      }
+   }
+   else
+   {
+      if(!OrderCalcMargin(ORDER_TYPE_SELL, _Symbol, volume, SymbolInfoDouble(_Symbol, SYMBOL_BID), requiredMargin))
+      {
+         LogError("Cannot calculate margin for SELL order");
+         return false;
+      }
+   }
+   
+   double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   if(requiredMargin > freeMargin)
+   {
+      LogError("Not enough margin: Required " + DoubleToString(requiredMargin, 2) + 
+               " > Available " + DoubleToString(freeMargin, 2));
+      return false;
+   }
+   
+   return true;
+}
+
+void ProcessSignal(string signalType, string direction, double volume, double tp, double sl)
+{
+   if(volume < MinimumLot && volume > 0) volume = MinimumLot;
+
+   if(signalType == "OPEN")
+   {
+      LogInfo("Processing OPEN signal: " + direction + " " + DoubleToString(volume, 2) + 
+              " lots, TP: " + DoubleToString(tp, 5) + ", SL: " + DoubleToString(sl, 5));
+      
+      // Validate trading parameters first
+      if(!ValidateTradeParameters(direction, volume, sl, tp))
+      {
+         LogError("Trade validation failed - signal rejected");
+         return;
+      }
+      
+      // Normalize SL/TP values - set to 0 if they are very small
+      if(MathAbs(sl) < 0.00001) sl = 0;
+      if(MathAbs(tp) < 0.00001) tp = 0;
+      
+      // Get current prices
+      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      
+      if(ask == 0 || bid == 0)
+      {
+         LogError("Cannot get current prices - ASK: " + DoubleToString(ask, 5) + 
+                 " BID: " + DoubleToString(bid, 5));
+         return;
+      }
+      
+      bool ok = false;
+      if(direction == "BUY" && volume > 0)
+      {
+         LogInfo("Executing BUY order at ASK: " + DoubleToString(ask, 5));
+         ok = trade.Buy(volume, _Symbol, ask, sl, tp, "Hedge");
+      }
+      else if(direction == "SELL" && volume > 0)
+      {
+         LogInfo("Executing SELL order at BID: " + DoubleToString(bid, 5));
+         ok = trade.Sell(volume, _Symbol, bid, sl, tp, "Hedge");
+      }
+      else
+      {
+         LogError("Invalid trade direction or volume: " + direction + " " + DoubleToString(volume, 2));
+         return;
+      }
+
+      int ret = trade.ResultRetcode();
+      
+      if(!ok)
+      {
+         string errorDetail = GetRetcodeDescription(ret);
+         LogError("Hedge OPEN failed: " + errorDetail + " (code: " + IntegerToString(ret) + 
+                 ") LastError: " + IntegerToString(GetLastError()));
+         
+         // Additional diagnostic info
+         LogError("Symbol: " + _Symbol + ", Volume: " + DoubleToString(volume, 2) + 
+                 ", Ask: " + DoubleToString(ask, 5) + ", Bid: " + DoubleToString(bid, 5));
+         LogError("Account margin free: " + DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_FREE), 2));
+         LogError("Trading allowed: " + (AccountInfoInteger(ACCOUNT_TRADE_ALLOWED) ? "Yes" : "No"));
+      }
+      else
+      {
+                  LogImportant("✅ Hedge OPEN " + direction + " " + DoubleToString(volume, 2) + 
+                        " lots SUCCESS (retcode: " + IntegerToString(ret) + ")");
+         
+         // Log the actual order details
+         if(trade.ResultOrder() > 0)
+         {
+            LogImportant("Order ticket: " + IntegerToString((long)trade.ResultOrder()) + 
+                        ", Fill price: " + DoubleToString(trade.ResultPrice(), 5));
+         }
+      }
+   }
+   else if(signalType == "MODIFY")
+   {
+      bool found = false;
+      for(int i = 0; i < PositionsTotal(); i++)
+      {
+         if(PositionSelectByTicket(PositionGetTicket(i)))
+         {
+            if(PositionGetInteger(POSITION_MAGIC) == Magic_Number && 
+               PositionGetString(POSITION_SYMBOL) == _Symbol)
+            {
+               ulong ticket = PositionGetTicket(i);
+               
+               // Normalize SL/TP values
+               if(MathAbs(sl) < 0.00001) sl = 0;
+               if(MathAbs(tp) < 0.00001) tp = 0;
+               
+               bool modifyOk = trade.PositionModify(ticket, sl, tp);
+               
+               if(modifyOk)
+               {
+                  LogImportant("✅ Hedge MODIFY successful - Ticket: " + IntegerToString(ticket) + 
+                              " SL: " + DoubleToString(sl, 5) + " TP: " + DoubleToString(tp, 5));
+               }
+               else
+               {
+                  int ret = trade.ResultRetcode();
+                  LogError("Hedge MODIFY failed: " + GetRetcodeDescription(ret) + 
+                          " (code: " + IntegerToString(ret) + ") Ticket: " + IntegerToString(ticket));
+               }
+               
+               found = true;
+               break;
+            }
+         }
+      }
+      
+      if(!found)
+      {
+         LogWarning("MODIFY signal received but no hedge position found");
+      }
+   }
+   else if((signalType == "PARTIAL_CLOSE" || signalType == "BLEED") && volume > 0)
+   {
+      bool found = false;
+      for(int i = 0; i < PositionsTotal(); i++)
+      {
+         if(PositionSelectByTicket(PositionGetTicket(i)))
+         {
+            if(PositionGetInteger(POSITION_MAGIC) == Magic_Number && 
+               PositionGetString(POSITION_SYMBOL) == _Symbol)
+            {
+               ulong ticket = PositionGetTicket(i);
+               double positionVolume = PositionGetDouble(POSITION_VOLUME);
+               
+               // Ensure we don't try to close more than available
+               if(volume > positionVolume)
+               {
+                  LogWarning("Requested close volume " + DoubleToString(volume, 2) + 
+                           " > position volume " + DoubleToString(positionVolume, 2) + 
+                           ". Adjusting to position volume.");
+                  volume = positionVolume;
+               }
+               
+               bool closeOk = trade.PositionClosePartial(ticket, volume);
+               
+               if(closeOk)
+               {
+                  LogImportant("✅ Hedge " + signalType + " successful - Closed " + 
+                              DoubleToString(volume, 2) + " lots from ticket " + IntegerToString(ticket));
+                  
+                  if(signalType == "BLEED") bleedDone = true;
+               }
+               else
+               {
+                  int ret = trade.ResultRetcode();
+                  LogError("Hedge " + signalType + " failed: " + GetRetcodeDescription(ret) + 
+                          " (code: " + IntegerToString(ret) + ") Ticket: " + IntegerToString(ticket));
+               }
+               
+               found = true;
+               break;
+            }
+         }
+      }
+      
+      if(!found)
+      {
+         LogWarning(signalType + " signal received but no hedge position found");
+      }
+   }
+   else
+   {
+      LogWarning("Unknown signal type or invalid parameters: " + signalType + 
+                " " + direction + " " + DoubleToString(volume, 2));
+   }
+}
+
+// Simple housekeeping print - greatly reduced frequency
 void ManageHedgePositions()
 {
-   static datetime last=0; if(TimeCurrent()-last<60) return; last=TimeCurrent();
+   static datetime last=0; 
+   if(TimeCurrent()-last<600) return; // Changed from 60 to 600 seconds (10 minutes)
+   last=TimeCurrent();
+   
    int cnt=0; double vol=0;
    for(int i=0;i<PositionsTotal();i++)
       if(PositionSelectByTicket(PositionGetTicket(i)))
          if(PositionGetInteger(POSITION_MAGIC)==Magic_Number && PositionGetString(POSITION_SYMBOL)==_Symbol)
          { cnt++; vol+=PositionGetDouble(POSITION_VOLUME);}  
-   Print("Active hedge pos: ",cnt," total ",DoubleToString(vol,2)," lots");
+   
+   if(cnt > 0 || LogVerbosity >= LOG_VERBOSE) { // Only log if positions exist or verbose mode
+      LogInfo("Active hedge pos: " + IntegerToString(cnt) + " total " + DoubleToString(vol,2) + " lots");
+   }
 }
 
 //────────────────────────────────────────────────────────────────────
-// 10. DASHBOARD (very lightweight)
+// 11. DASHBOARD (very lightweight)
 //────────────────────────────────────────────────────────────────────
 void CreateLabel(string name,string txt,int x,int y,color c){
    ObjectCreate(0,name,OBJ_LABEL,0,0,0);
@@ -697,26 +928,29 @@ void CreateDashboard()
    ObjectSetInteger(0,dash+"bg",OBJPROP_XDISTANCE,20);
    ObjectSetInteger(0,dash+"bg",OBJPROP_YDISTANCE,20);
    ObjectSetInteger(0,dash+"bg",OBJPROP_XSIZE,260);
-   ObjectSetInteger(0,dash+"bg",OBJPROP_YSIZE,200); // Increased height for more info
+   ObjectSetInteger(0,dash+"bg",OBJPROP_YSIZE,220); // Increased height for log level display
    ObjectSetInteger(0,dash+"bg",OBJPROP_BGCOLOR,clrNavy);
    ObjectSetInteger(0,dash+"bg",OBJPROP_STYLE,STYLE_SOLID);
    ObjectSetInteger(0,dash+"bg",OBJPROP_HIDDEN,true);
 
-   CreateLabel(dash+"title","PropEA Hedge v2.04", 150,35, clrGold);
+   CreateLabel(dash+"title","PropEA Hedge v2.05", 150,35, clrGold);
    CreateLabel(dash+"commL","Comm",  40,70, clrWhite);
    CreateLabel(dash+"commV",CommunicationMethod == GLOBAL_VARS ? "Global" : "Files", 120,70, clrYellow);
    CreateLabel(dash+"linkL","Link",   40,90, clrWhite);
    CreateLabel(dash+"linkV","--",    120,90, clrRed);
    CreateLabel(dash+"bleedL","Bleed", 40,110, clrWhite);
    CreateLabel(dash+"bleedV","Pending",120,110, clrRed);
+   CreateLabel(dash+"logL","Log Level", 40,130, clrWhite);
+   CreateLabel(dash+"logV",LogVerbosity == LOG_ERRORS_ONLY ? "Errors" : 
+                          LogVerbosity == LOG_IMPORTANT ? "Important" : "Verbose", 120,130, clrCyan);
    
    // Add diagnostic info to dashboard
-   CreateLabel(dash+"magicL","Magic", 40,130, clrWhite);
-   CreateLabel(dash+"magicV",IntegerToString(Magic_Number),120,130, clrWhite);
-   CreateLabel(dash+"sourceL","Source", 40,150, clrWhite);
-   CreateLabel(dash+"sourceV",IntegerToString(SourceEA_Magic),120,150, clrWhite);
-   CreateLabel(dash+"hbL","Last HB", 40,170, clrWhite);
-   CreateLabel(dash+"hbV","--",120,170, clrWhite);
+   CreateLabel(dash+"magicL","Magic", 40,150, clrWhite);
+   CreateLabel(dash+"magicV",IntegerToString(Magic_Number),120,150, clrWhite);
+   CreateLabel(dash+"sourceL","Source", 40,170, clrWhite);
+   CreateLabel(dash+"sourceV",IntegerToString(SourceEA_Magic),120,170, clrWhite);
+   CreateLabel(dash+"hbL","Last HB", 40,190, clrWhite);
+   CreateLabel(dash+"hbV","--",120,190, clrWhite);
 }
 
 void UpdateDashboard()
