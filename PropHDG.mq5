@@ -286,11 +286,6 @@ bool IsLinkAlive()
 //| Enhanced OnInit for Hedge EA with Link Verification              |
 //+------------------------------------------------------------------+
 
-// Add these global variables to your Hedge EA
-bool mainEALinkRequired = true;        // Hedge EA always requires main EA link
-bool mainEALinkEstablished = false;    // Status of main EA connection
-datetime lastMainEACheck = 0;          // Last time we checked main EA
-bool hedgeReadyForTrading = false;     // Overall trading readiness status
 
 int OnInit()
 {
@@ -938,7 +933,7 @@ void ProcessSignal(string signalType, string direction, double volume, double tp
          return;
       }
 
-      int ret = trade.ResultRetcode();
+      uint ret = trade.ResultRetcode();
       
       if(!ok)
       {
@@ -990,7 +985,7 @@ void ProcessSignal(string signalType, string direction, double volume, double tp
                }
                else
                {
-                  int ret = trade.ResultRetcode();
+                  uint ret = trade.ResultRetcode();
                   LogError("Hedge MODIFY failed: " + GetRetcodeDescription(ret) + 
                           " (code: " + IntegerToString(ret) + ") Ticket: " + IntegerToString(ticket));
                }
@@ -1039,7 +1034,7 @@ void ProcessSignal(string signalType, string direction, double volume, double tp
                }
                else
                {
-                  int ret = trade.ResultRetcode();
+                  uint ret = trade.ResultRetcode();
                   LogError("Hedge " + signalType + " failed: " + GetRetcodeDescription(ret) + 
                           " (code: " + IntegerToString(ret) + ") Ticket: " + IntegerToString(ticket));
                }
