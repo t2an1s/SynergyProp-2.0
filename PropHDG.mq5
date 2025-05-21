@@ -75,6 +75,7 @@ int timerCount = 0;
 string COMM_FILE_PATH = "MQL5\\Files\\MT5com.txt";
 string HEARTBEAT_FILE_PATH = "MQL5\\Files\\MT5com_hedge_heartbeat.txt";
 string MAIN_HEARTBEAT_FILE_PATH = "MQL5\\Files\\MT5com_heartbeat.txt";
+string HEDGE_DATA_FILE_PATH = "MQL5\\Files\\HedgeData.txt";
 const int FILE_WRITE_RETRY = 3;   // Number of retries for file operations
 const int FILE_CHECK_SECONDS = 5;  // How often to check for heartbeat
 
@@ -353,6 +354,8 @@ int OnInit()
       LogImportant("- Hedge heartbeat: " + HEARTBEAT_FILE_PATH);
       LogImportant("- Main heartbeat: " + MAIN_HEARTBEAT_FILE_PATH);
       LogImportant("- Signal file: " + COMM_FILE_PATH);
+      HEDGE_DATA_FILE_PATH = commonPath + "HedgeData.txt";
+      LogImportant("- Hedge data file: " + HEDGE_DATA_FILE_PATH);
       
       // Test file access for heartbeat with FILE_COMMON flag
       int fileHandle = FileOpen(HEARTBEAT_FILE_PATH, FILE_WRITE|FILE_TXT|FILE_COMMON);
@@ -592,6 +595,7 @@ void OnTick()
    if(!EnableTrading) return;
 
    UpdateDashboard();
+   PublishHedgeMetrics();
 
    // Greatly reduced status logging - only every 10 minutes instead of 1 minute
    static datetime lastTickLog = 0;
@@ -1162,3 +1166,24 @@ string GetHedgeStatusDescription()
 
 
 void DeleteDashboard(){ ObjectsDeleteAll(0,dash); }
+
+//+------------------------------------------------------------------+
+//| Publish hedge account metrics                                     |
+//+------------------------------------------------------------------+
+void PublishHedgeMetrics()
+{
+   string data = DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2) + "," +
+                  DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2) + "," +
+                  DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_FREE), 2);
+
+   int handle = FileOpen(HEDGE_DATA_FILE_PATH, FILE_WRITE|FILE_TXT|FILE_COMMON);
+   if(handle != INVALID_HANDLE)
+   {
+      FileWriteString(handle, data);
+      FileClose(handle);
+   }
+   else
+   {
+      LogError("Failed to write hedge metrics: " + IntegerToString(GetLastError()));
+   }
+}

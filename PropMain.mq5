@@ -53,6 +53,7 @@ bool         linkWasOK        = false;      // remembers previous state for debu
 string COMM_FILE_PATH = "MQL5\\Files\\MT5com.txt";
 string HEARTBEAT_FILE_PATH = "MQL5\\Files\\MT5com_heartbeat.txt";
 string HEDGE_HEARTBEAT_FILE_PATH = "MQL5\\Files\\MT5com_hedge_heartbeat.txt";
+string DASH_DATA_FILE_PATH = "MQL5\\Files\\PropDashData.txt";
 const int FILE_WRITE_RETRY = 3;
 const int FILE_CHECK_SECONDS = 5;
 
@@ -855,12 +856,14 @@ int OnInit()
       HEDGE_HEARTBEAT_FILE_PATH = commonPath + "MT5com_hedge_heartbeat.txt";
       COMM_FILE_PATH            = commonPath + "MT5com.txt";
       SignalFilePath            = commonPath + "Synergy_Signals.txt";
+      DASH_DATA_FILE_PATH       = commonPath + "PropDashData.txt";
       
       Print("File paths configured:");
       Print("- HEARTBEAT_FILE_PATH: ", HEARTBEAT_FILE_PATH);
       Print("- HEDGE_HEARTBEAT_FILE_PATH: ", HEDGE_HEARTBEAT_FILE_PATH);
       Print("- COMM_FILE_PATH: ", COMM_FILE_PATH);
       Print("- SignalFilePath: ", SignalFilePath);
+      Print("- DASH_DATA_FILE_PATH: ", DASH_DATA_FILE_PATH);
       
       // Test file access for heartbeat with FILE_COMMON flag
       Print("Attempting to create heartbeat file...");
@@ -917,12 +920,14 @@ int OnInit()
             HEDGE_HEARTBEAT_FILE_PATH = "MQL5\\Files\\MT5com_hedge_heartbeat.txt";
             COMM_FILE_PATH = "MQL5\\Files\\MT5com.txt";
             SignalFilePath = "MQL5\\Files\\Synergy_Signals.txt";
+            DASH_DATA_FILE_PATH = "MQL5\\Files\\PropDashData.txt";
             
             Print("🔄 UPDATED all file paths to use MQL5\\Files\\ directory:");
             Print("   - HEARTBEAT_FILE_PATH: ", HEARTBEAT_FILE_PATH);
             Print("   - HEDGE_HEARTBEAT_FILE_PATH: ", HEDGE_HEARTBEAT_FILE_PATH);
             Print("   - COMM_FILE_PATH: ", COMM_FILE_PATH);
             Print("   - SignalFilePath: ", SignalFilePath);
+            Print("   - DASH_DATA_FILE_PATH: ", DASH_DATA_FILE_PATH);
          }
          else
          {
@@ -1032,8 +1037,7 @@ int OnInit()
    BARS_REQUIRED = MathMax(PivotTPBars + PivotLengthLeft + PivotLengthRight + 5, 100);
    Print("History warm-up requirement set to ",BARS_REQUIRED," bars");   
    
-   // Create dashboard 
-   CreateDashboard();
+
    
    // Initialize scale-out tracking variables
    scaleOut1LongTriggered = false;
@@ -1104,6 +1108,9 @@ int OnInit()
    Print("Synergy Strategy v1.04 initialised. Hedge factor:",DoubleToString(hedgeFactor,4));
    Print("=== INITIALIZATION COMPLETED ===");
 
+   // Publish initial dashboard state
+   PublishDashboardData();
+
    return(INIT_SUCCEEDED);
 }
 
@@ -1142,8 +1149,8 @@ void OnTick()
       return;
    }
 
-   // 1) update dashboard & visuals every tick
-   UpdateDashboard();
+   // 1) publish metrics and update visuals
+   PublishDashboardData();
    if(ShowPivotLines)  DrawPivotLines();
    if(ShowMarketBias)  ShowMarketBiasIndicator();
 
@@ -1361,8 +1368,6 @@ void OnDeinit(const int reason)
    ReleaseMarketBias();
    ReleaseADXFilter();
    
-   // Delete dashboard and other objects
-   DeleteDashboard();
    EventKillTimer();
    
    // Clean up visual elements
@@ -2040,7 +2045,6 @@ ENUM_TIMEFRAMES GetTimeframeFromString(string tfString)
    return PERIOD_CURRENT;
 }
 
-#include "PropMain_Dash.mq5"
 //+------------------------------------------------------------------+
 
 //+------------------------------------------------------------------+
@@ -2522,6 +2526,31 @@ void SendHedgeBleedSignal()
    
    // Send the signal
    SendHedgeSignal("BLEED", direction, bleedVolume, 0, 0);
+}
+
+//+------------------------------------------------------------------+
+//| Publish dashboard metrics to shared file                          |
+//+------------------------------------------------------------------+
+void PublishDashboardData()
+{
+   // Build comma-separated data string
+   string data = DoubleToString(synergyScore, 2) + "," +
+                  (currentBiasPositive ? "1" : "0") + "," +
+                  (adxTrendCondition ? "1" : "0") + "," +
+                  DoubleToString(effectiveADXThreshold, 2) + "," +
+                  (entryTriggersEnabled ? "1" : "0") + "," +
+                  DoubleToString(hedgeFactor, 2);
+
+   int handle = FileOpen(DASH_DATA_FILE_PATH, FILE_WRITE|FILE_TXT|FILE_COMMON);
+   if(handle != INVALID_HANDLE)
+   {
+      FileWriteString(handle, data);
+      FileClose(handle);
+   }
+   else
+   {
+      Print("Failed to publish dashboard data: ", GetLastError());
+   }
 }
 
 //+------------------------------------------------------------------+
