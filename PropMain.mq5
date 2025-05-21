@@ -1,6 +1,42 @@
 //+------------------------------------------------------------------+
 //| Fixed bar confirmation function for true bar close               |
 //+------------------------------------------------------------------+
+
+// --- Placeholder global variables to allow successful compilation ---
+double   Open[], High[], Low[], Close[];
+datetime TimeSeries[];
+int      BARS_REQUIRED      = 100;
+bool     ShowPivotLines     = true;
+bool     ShowMarketBias     = true;
+double   synergyScore       = 0.0;
+bool     currentBiasPositive = false;
+bool     biasChangedToBullish = false;
+bool     biasChangedToBearish = false;
+bool     adxTrendCondition  = false;
+double   effectiveADXThreshold = 0.0;
+double   pivotStopLongEntry  = 0.0,
+         pivotTpLongEntry    = 0.0,
+         pivotStopShortEntry = 0.0,
+         pivotTpShortEntry   = 0.0;
+
+// Forward declarations for helper functions used later in the file
+bool   IsNewBar();
+bool   IsInTradingSession();
+bool   HasOpenPosition();
+void   UpdateDashboard();
+void   DrawPivotLines();
+void   DrawDetectedPivotLines();
+void   ShowMarketBiasIndicator();
+void   ManageOpenPositions();
+void   OpenTrade(bool isBuy,double sl,double tp);
+void   TryAlternativeSignalMethod(string data);
+string GetErrorDescription(int code);
+double FindDeepestPivotLowBelowClose(int lookbackBars);
+double FindHighestPivotHighAboveClose(int lookbackBars);
+void   CalculateSynergyScore();
+void   CalculateMarketBias();
+void   CalculateADXFilter();
+void   CheckBleedCondition();
 bool IsConfirmedBar()
 {
    static datetime lastBarTime = 0;
@@ -123,9 +159,9 @@ void OnTick()
    Print("DEBUG: Successfully copied price data - Arrays size: ", ArraySize(Close));
 
    // 5) session filter with logging
-   bool inSession = IsInTradingSession();
-   Print("DEBUG: Trading Session Check: ", inSession ? "IN SESSION" : "OUT OF SESSION");
-   if(!inSession) {
+   bool sessionAllowed = IsInTradingSession();
+   Print("DEBUG: Trading Session Check: ", sessionAllowed ? "IN SESSION" : "OUT OF SESSION");
+   if(!sessionAllowed) {
       Print("DEBUG: Outside trading session - exiting");
       return;
    }
@@ -434,3 +470,69 @@ void SendHedgeSignal(string signalType, string direction, double volume, double 
       }
    }
 }
+
+// -----------------------------------------------------------------
+// Stub implementations for missing helper functions
+// -----------------------------------------------------------------
+
+bool IsNewBar()
+{
+   static datetime lastBar = 0;
+   datetime cur = iTime(_Symbol, PERIOD_CURRENT, 0);
+   if(cur!=lastBar){ lastBar=cur; return true; }
+   return false;
+}
+
+bool IsInTradingSession()
+{
+   return true;
+}
+
+bool HasOpenPosition()
+{
+   return false;
+}
+
+void UpdateDashboard(){}
+
+void DrawPivotLines(){}
+
+void DrawDetectedPivotLines(){ DrawPivotLines(); }
+
+void ShowMarketBiasIndicator(){}
+
+void ManageOpenPositions(){}
+
+void OpenTrade(bool isBuy,double sl,double tp)
+{
+   Print("[Stub] OpenTrade called: ", isBuy ? "BUY" : "SELL", " SL:", sl, " TP:", tp);
+}
+
+void TryAlternativeSignalMethod(string data)
+{
+   Print("[Stub] TryAlternativeSignalMethod: ", data);
+}
+
+string GetErrorDescription(int code)
+{
+   return IntegerToString(code);
+}
+
+double FindDeepestPivotLowBelowClose(int lookbackBars)
+{
+   return 0.0;
+}
+
+double FindHighestPivotHighAboveClose(int lookbackBars)
+{
+   return 0.0;
+}
+
+void CalculateSynergyScore(){}
+
+void CalculateMarketBias(){}
+
+void CalculateADXFilter(){}
+
+void CheckBleedCondition(){}
+
