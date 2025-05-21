@@ -256,31 +256,43 @@ void SendHeartbeat(bool isPropSide)
    }
    else // FILE_BASED
    {
-      // Create heartbeat file with timestamp
+      string heartbeatData = "MAIN_HEARTBEAT," + IntegerToString(Magic_Number) + "," + 
+                            IntegerToString(TimeCurrent());
+      
+      // Force cleanup first
+      CleanupFileHandles();
+      
+      // Reset error state
+      ResetLastError();
+      
       int fileHandle = FileOpen(HEARTBEAT_FILE_PATH, FILE_WRITE|FILE_TXT|FILE_COMMON);
       if(fileHandle != INVALID_HANDLE)
       {
-         string heartbeatData = "MAIN_HEARTBEAT," + IntegerToString(Magic_Number) + "," + 
-                               IntegerToString(TimeCurrent());
          FileWriteString(fileHandle, heartbeatData);
+         FileFlush(fileHandle);
          FileClose(fileHandle);
          
          // Report success with lower frequency to avoid log spam
          static datetime lastReport = 0;
          if(TimeCurrent() - lastReport > 60) {  // Report once per minute
-            Print("Main EA heartbeat sent to file: ", HEARTBEAT_FILE_PATH);
+            Print("✅ Main EA heartbeat sent to file: ", HEARTBEAT_FILE_PATH);
             lastReport = TimeCurrent();
          }
       }
       else
       {
          int error = GetLastError();
-         Print("ERROR: Failed to write heartbeat file: ", error);
+         static datetime lastErrorReport = 0;
+         if(TimeCurrent() - lastErrorReport > 30) { // Report errors every 30 seconds
+            Print("❌ ERROR: Failed to write heartbeat file: ", error, " (", GetErrorDescription(error), ")");
+            lastErrorReport = TimeCurrent();
+         }
       }
       
       lastPulseSent = (ulong)TimeCurrent();
    }
 }
+
 
 //────────────────────────────────────────────────────────────────────
 // REPLACE THE IsLinkAlive FUNCTION
@@ -403,6 +415,396 @@ bool IsLinkAlive(bool isPropSide)
    }
 }
 
+void OpenTrade(bool isLong, const double sl, const double tp)
+{
+   // STRICT PIVOT VALIDATION - NO TRADE IF INVALID
+   if(sl <= 0 || tp <= 0)
+   {
+      Print("❌ OpenTrade ABORTED: Invalid pivot levels - SL:", DoubleToString(sl, 5), " TP:", DoubleToString(tp, 5));
+      return;
+   }
+   
+   double currentPrice = Close[0];
+   
+   // STRICT PIVOT LOGIC VALIDATION
+   if(isLong)
+   {
+      if(sl >= currentPrice || tp <= currentPrice)
+      {
+         Print("❌ LONG Trade ABORTED: Invalid pivot relationship");
+         Print("   Current Price: ", DoubleToString(currentPrice, 5));
+         Print("   Pivot SL: ", DoubleToString(sl, 5), " (must be < current)");
+         Print("   Pivot TP: ", DoubleToString(tp, 5), " (must be > current)");
+         return;
+      }
+   }
+   else
+   {
+      if(sl <= currentPrice || tp >= currentPrice)
+      {
+         Print("❌ SHORT Trade ABORTED: Invalid pivot relationship");
+         Print("   Current Price: ", DoubleToString(currentPrice, 5));
+         Print("   Pivot SL: ", DoubleToString(sl, 5), " (must be > current)");
+         Print("   Pivot TP: ", DoubleToString(tp, 5), " (must be < current)");
+         return;
+      }
+   }
+   
+   // Check minimum stop distances WITHOUT modifying pivot levels
+   double stopPts = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double minDist = stopPts * _Point;
+   double askPrice = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bidPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   
+   Print("=== PIVOT TRADE VALIDATION ===");
+   Print("Current Ask: ", DoubleToString(askPrice, 5), " Bid: ", DoubleToString(bidPrice, 5));
+   Print("Min Stop Distance: ", DoubleToString(minDist, 5), " (", stopPts, " points)");
+   Print("Requested SL: ", DoubleToString(sl, 5));
+   Print("Requested TP: ", DoubleToString(tp, 5));
+   
+   if(isLong)
+   {
+      double slDist = askPrice - sl;
+      double tpDist = tp - askPrice;
+      Print("LONG distances - SL: ", DoubleToString(slDist, 5), " TP: ", DoubleToString(tpDist, 5));
+      
+      if(slDist < minDist || tpDist < minDist)
+      {
+         Print("❌ LONG Trade ABORTED: Pivot levels don't meet broker minimum stop distance");
+         Print("   Required min distance: ", DoubleToString(minDist, 5));
+         Print("   SL distance: ", DoubleToString(slDist, 5), " (", slDist >= minDist ? "OK" : "TOO CLOSE", ")");
+         Print("   TP distance: ", DoubleToString(tpDist, 5), " (", tpDist >= minDist ? "OK" : "TOO CLOSE", ")");
+         return;
+      }
+   }
+   else
+   {
+      double slDist = sl - bidPrice;
+      double tpDist = bidPrice - tp;
+      Print("SHORT distances - SL: ", DoubleToString(slDist, 5), " TP: ", DoubleToString(tpDist, 5));
+      
+      if(slDist < minDist || tpDist < minDist)
+      {
+         Print("❌ SHORT Trade ABORTED: Pivot levels don't meet broker minimum stop distance");
+         Print("   Required min distance: ", DoubleToString(minDist, 5));
+         Print("   SL distance: ", DoubleToString(slDist, 5), " (", slDist >= minDist ? "OK" : "TOO CLOSE", ")");
+         Print("   TP distance: ", DoubleToString(tpDist, 5), " (", tpDist >= minDist ? "OK" : "TOO CLOSE", ")");
+         return;
+      }
+   }
+
+   // Use EXACT pivot levels - NO MODIFICATION
+   double finalSL = NormalizeDouble(sl, _Digits);
+   double finalTP = NormalizeDouble(tp, _Digits);
+   
+   Print("✅ PIVOT LEVELS VALIDATED - Proceeding with trade");
+   Print("   Final SL: ", DoubleToString(finalSL, 5));
+   Print("   Final TP: ", DoubleToString(finalTP, 5));
+
+   //––– Calculate lot size
+   double slPips = MathAbs(currentPrice - finalSL) / GetPipSize();
+   
+   Print("=== LOT SIZE CALCULATION ===");
+   Print("OpenTrade: UseFixedLot=", UseFixedLot, ", FixedLotSize=", FixedLotSize, ", RiskPercent=", RiskPercent);
+   
+   double rawLots;
+   if(UseFixedLot) {
+      rawLots = FixedLotSize;
+      Print("Using fixed lot size: ", FixedLotSize);
+   } else {
+      rawLots = CalculatePositionSize(slPips, RiskPercent);
+      Print("Using risk-based lot size: ", rawLots, " (SL pips: ", slPips, ", Risk%: ", RiskPercent, ")");
+   }
+   
+   double lots = NormalizeLots(rawLots);
+   Print("Final normalized lot size: ", lots);
+
+   //––– Calculate hedge volume
+   double lotLive = NormalizeLots(lots * hedgeFactor);
+
+   // Record for later
+   lastEntryLots = lots;
+   hedgeLotsLast = lotLive;
+
+   //––– Place main order with EXACT pivot levels
+   Print("=== EXECUTING TRADE ===");
+   Print("Direction: ", isLong ? "LONG" : "SHORT");
+   Print("Volume: ", DoubleToString(lots, 2));
+   Print("Entry: ~", DoubleToString(isLong ? askPrice : bidPrice, 5));
+   Print("Stop Loss: ", DoubleToString(finalSL, 5));
+   Print("Take Profit: ", DoubleToString(finalTP, 5));
+   
+   bool ok = isLong
+             ? trade.Buy(lots, _Symbol, 0, finalSL, finalTP, "Long_Pivot")
+             : trade.Sell(lots, _Symbol, 0, finalSL, finalTP, "Short_Pivot");
+
+   if(!ok) { 
+      int error = trade.ResultRetcode();
+      Print("❌ OpenTrade(): order failed – Error: ", error, " (", trade.ResultComment(), ")");
+      return;
+   }
+
+   Print("✅ TRADE EXECUTED SUCCESSFULLY!");
+   Print("   Order ticket: ", trade.ResultOrder());
+   Print("   Execution price: ", DoubleToString(trade.ResultPrice(), 5));
+
+   // Reset per-side flags
+   if(isLong) { 
+      scaleOut1LongTriggered = false; 
+      beAppliedLong = false; 
+   }
+   else { 
+      scaleOut1ShortTriggered = false; 
+      beAppliedShort = false; 
+   }
+
+   //––– Fire hedge order
+   if(EnableHedgeCommunication)
+   {
+      Print("=== SENDING HEDGE SIGNAL ===");
+      Print("Hedge Direction: ", isLong ? "SELL" : "BUY");
+      Print("Hedge Volume: ", DoubleToString(lotLive, 2));
+      Print("Hedge TP: ", DoubleToString(finalTP, 5));
+      Print("Hedge SL: ", DoubleToString(finalSL, 5));
+      
+      SendHedgeSignal("OPEN", isLong? "SELL":"BUY", lotLive, finalTP, finalSL);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Manage open positions (scale-out, breakeven, trailing)           |
+//+------------------------------------------------------------------+
+void ManageOpenPositions()
+{
+   // Get current position
+   if(!PositionSelect(_Symbol)) return;
+   
+   // Check if the position belongs to this EA
+   if(PositionGetInteger(POSITION_MAGIC) != Magic_Number) return;
+   
+   double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+   double positionVolume = PositionGetDouble(POSITION_VOLUME);
+   ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+   datetime positionTime = (datetime)PositionGetInteger(POSITION_TIME);
+   
+   // PREVENT IMMEDIATE MANAGEMENT - Wait at least 10 seconds after position opens
+   int positionAge = (int)(TimeCurrent() - positionTime);
+   if(positionAge < 10)
+   {
+      static datetime lastWarning = 0;
+      if(TimeCurrent() - lastWarning > 5)
+      {
+         Print("DEBUG: Position management delayed - Position age: ", positionAge, " seconds (waiting for 10s)");
+         lastWarning = TimeCurrent();
+      }
+      return;
+   }
+   
+   // LONG position management
+   if(posType == POSITION_TYPE_BUY)
+   {
+      double distInPips = (Close[0] - entryPrice) / GetPipSize();
+      
+      // Scale-out logic for long positions
+      if(EnableScaleOut && ScaleOut1Enabled && !scaleOut1LongTriggered && pivotTpLongEntry > 0)
+      {
+         // Calculate scale-out price at specified percentage of the target distance
+         double scaleOut1Price = entryPrice + ((pivotTpLongEntry - entryPrice) * ScaleOut1Pct / 100.0);
+         
+         Print("DEBUG: LONG Scale-out check - Current: ", DoubleToString(Close[0], 5), 
+               " Target: ", DoubleToString(scaleOut1Price, 5), 
+               " Progress: ", DoubleToString(distInPips, 1), " pips");
+         
+         // Execute scale-out when price reaches the level
+         if(Close[0] >= scaleOut1Price)
+         {
+            scaleOut1LongTriggered = true;
+            double partialQty = positionVolume * (ScaleOut1Size / 100.0);
+            
+            Print("🎯 EXECUTING LONG SCALE-OUT:");
+            Print("   Price reached: ", DoubleToString(Close[0], 5));
+            Print("   Target was: ", DoubleToString(scaleOut1Price, 5));
+            Print("   Closing volume: ", DoubleToString(partialQty, 2));
+            
+            if(trade.PositionClosePartial(PositionGetTicket(0), partialQty))
+            {
+               Print("✅ Long position scaled out successfully!");
+               
+               // Set breakeven if enabled
+               if(ScaleOut1BE && !beAppliedLong && pivotStopLongEntry < entryPrice)
+               {
+                  beAppliedLong = true;
+                  double newSL = entryPrice;
+                  
+                  Print("🔄 Setting breakeven after scale-out:");
+                  Print("   Old SL: ", DoubleToString(pivotStopLongEntry, 5));
+                  Print("   New SL: ", DoubleToString(newSL, 5));
+                  
+                  if(trade.PositionModify(PositionGetTicket(0), newSL, pivotTpLongEntry))
+                  {
+                     Print("✅ Long position SL moved to breakeven after scale-out");
+                     pivotStopLongEntry = newSL;
+                     
+                     // Signal hedge EA about stop adjustment
+                     if(EnableHedgeCommunication)
+                     {
+                        SendHedgeSignal("MODIFY", "SELL", 0, pivotTpLongEntry, newSL);
+                        Print("📤 Hedge modify signal sent: SL adjusted to ", DoubleToString(newSL, 5));
+                     }
+                  }
+                  else
+                  {
+                     Print("❌ Failed to move SL to breakeven. Error: ", trade.ResultRetcode());
+                  }
+               }
+               
+               // Signal hedge EA about scale-out
+               if(EnableHedgeCommunication)
+               {
+                  double hedgeScaleOutLots = NormalizeLots(partialQty * hedgeFactor);
+                  SendHedgeSignal("PARTIAL_CLOSE", "SELL", hedgeScaleOutLots, 0, 0);
+                  Print("📤 Hedge partial close signal sent: SELL ", DoubleToString(hedgeScaleOutLots, 2));
+               }
+            }
+            else
+            {
+               Print("❌ Scale-out failed. Error: ", trade.ResultRetcode(), " (", trade.ResultComment(), ")");
+            }
+         }
+      }
+      
+      // Regular breakeven (separate from scale-out)
+      if(EnableBreakEven && !beAppliedLong && distInPips >= BeTriggerPips)
+      {
+         beAppliedLong = true;
+         double newSL = entryPrice;
+         
+         Print("🔄 Regular breakeven triggered:");
+         Print("   Distance: ", DoubleToString(distInPips, 1), " pips (trigger: ", BeTriggerPips, ")");
+         Print("   Old SL: ", DoubleToString(pivotStopLongEntry, 5));
+         Print("   New SL: ", DoubleToString(newSL, 5));
+         
+         if(trade.PositionModify(PositionGetTicket(0), newSL, pivotTpLongEntry))
+         {
+            Print("✅ Long position SL moved to breakeven");
+            pivotStopLongEntry = newSL;
+            
+            // Signal hedge EA about stop adjustment
+            if(EnableHedgeCommunication)
+            {
+               SendHedgeSignal("MODIFY", "SELL", 0, pivotTpLongEntry, newSL);
+               Print("📤 Hedge modify signal sent: SL adjusted to ", DoubleToString(newSL, 5));
+            }
+         }
+         else
+         {
+            Print("❌ Failed to move SL to breakeven. Error: ", trade.ResultRetcode());
+         }
+      }
+   }
+   
+   // SHORT position management (similar structure)
+   if(posType == POSITION_TYPE_SELL)
+   {
+      double distInPips = (entryPrice - Close[0]) / GetPipSize();
+      
+      // Scale-out logic for short positions
+      if(EnableScaleOut && ScaleOut1Enabled && !scaleOut1ShortTriggered && pivotTpShortEntry > 0)
+      {
+         double scaleOut1Price = entryPrice - ((entryPrice - pivotTpShortEntry) * ScaleOut1Pct / 100.0);
+         
+         Print("DEBUG: SHORT Scale-out check - Current: ", DoubleToString(Close[0], 5), 
+               " Target: ", DoubleToString(scaleOut1Price, 5), 
+               " Progress: ", DoubleToString(distInPips, 1), " pips");
+         
+         if(Close[0] <= scaleOut1Price)
+         {
+            scaleOut1ShortTriggered = true;
+            double partialQty = positionVolume * (ScaleOut1Size / 100.0);
+            
+            Print("🎯 EXECUTING SHORT SCALE-OUT:");
+            Print("   Price reached: ", DoubleToString(Close[0], 5));
+            Print("   Target was: ", DoubleToString(scaleOut1Price, 5));
+            Print("   Closing volume: ", DoubleToString(partialQty, 2));
+            
+            if(trade.PositionClosePartial(PositionGetTicket(0), partialQty))
+            {
+               Print("✅ Short position scaled out successfully!");
+               
+               // Set breakeven if enabled
+               if(ScaleOut1BE && !beAppliedShort && pivotStopShortEntry > entryPrice)
+               {
+                  beAppliedShort = true;
+                  double newSL = entryPrice;
+                  
+                  Print("🔄 Setting breakeven after scale-out:");
+                  Print("   Old SL: ", DoubleToString(pivotStopShortEntry, 5));
+                  Print("   New SL: ", DoubleToString(newSL, 5));
+                  
+                  if(trade.PositionModify(PositionGetTicket(0), newSL, pivotTpShortEntry))
+                  {
+                     Print("✅ Short position SL moved to breakeven after scale-out");
+                     pivotStopShortEntry = newSL;
+                     
+                     // Signal hedge EA about stop adjustment
+                     if(EnableHedgeCommunication)
+                     {
+                        SendHedgeSignal("MODIFY", "BUY", 0, pivotTpShortEntry, newSL);
+                        Print("📤 Hedge modify signal sent: SL adjusted to ", DoubleToString(newSL, 5));
+                     }
+                  }
+                  else
+                  {
+                     Print("❌ Failed to move SL to breakeven. Error: ", trade.ResultRetcode());
+                  }
+               }
+               
+               // Signal hedge EA about scale-out
+               if(EnableHedgeCommunication)
+               {
+                  double hedgeScaleOutLots = NormalizeLots(partialQty * hedgeFactor);
+                  SendHedgeSignal("PARTIAL_CLOSE", "BUY", hedgeScaleOutLots, 0, 0);
+                  Print("📤 Hedge partial close signal sent: BUY ", DoubleToString(hedgeScaleOutLots, 2));
+               }
+            }
+            else
+            {
+               Print("❌ Scale-out failed. Error: ", trade.ResultRetcode(), " (", trade.ResultComment(), ")");
+            }
+         }
+      }
+      
+      // Regular breakeven (separate from scale-out)
+      if(EnableBreakEven && !beAppliedShort && distInPips >= BeTriggerPips)
+      {
+         beAppliedShort = true;
+         double newSL = entryPrice;
+         
+         Print("🔄 Regular breakeven triggered:");
+         Print("   Distance: ", DoubleToString(distInPips, 1), " pips (trigger: ", BeTriggerPips, ")");
+         Print("   Old SL: ", DoubleToString(pivotStopShortEntry, 5));
+         Print("   New SL: ", DoubleToString(newSL, 5));
+         
+         if(trade.PositionModify(PositionGetTicket(0), newSL, pivotTpShortEntry))
+         {
+            Print("✅ Short position SL moved to breakeven");
+            pivotStopShortEntry = newSL;
+            
+            // Signal hedge EA about stop adjustment
+            if(EnableHedgeCommunication)
+            {
+               SendHedgeSignal("MODIFY", "BUY", 0, pivotTpShortEntry, newSL);
+               Print("📤 Hedge modify signal sent: SL adjusted to ", DoubleToString(newSL, 5));
+            }
+         }
+         else
+         {
+            Print("❌ Failed to move SL to breakeven. Error: ", trade.ResultRetcode());
+         }
+      }
+   }
+}
+
 ////+------------------------------------------------------------------+
 //| Expert initialization function                                    |
 //+------------------------------------------------------------------+
@@ -410,6 +812,15 @@ int OnInit()
 {
    // Set this at the very beginning of OnInit
    EnableHedgeCommunication = InputEnableHedgeCommunication;
+
+   Print("=== INITIALIZATION STARTED ===");
+   Print("InputEnableHedgeCommunication: ", InputEnableHedgeCommunication ? "TRUE" : "FALSE");
+   Print("CommunicationMethod: ", CommunicationMethod == GLOBAL_VARS ? "GLOBAL_VARS" : "FILE_BASED");
+   Print("TestingMode: ", TestingMode ? "TRUE" : "FALSE");
+   Print("MQL_TESTER: ", MQLInfoInteger(MQL_TESTER) ? "TRUE" : "FALSE");
+
+   // Clean up any existing file handles first
+   CleanupFileHandles();
 
    // Set trade parameters
    trade.SetExpertMagicNumber(Magic_Number);
@@ -424,40 +835,164 @@ int OnInit()
       Print("Running in Strategy Tester Mode - Hedge communication disabled");
    }
 
+   Print("Final EnableHedgeCommunication: ", EnableHedgeCommunication ? "TRUE" : "FALSE");
+
    // Initialize file paths for cross-terminal communication
+   Print("=== FILE COMMUNICATION SETUP ===");
    if(EnableHedgeCommunication && CommunicationMethod == FILE_BASED)
    {
+      Print("Setting up FILE_BASED communication...");
+      
       // Use common data folder so both terminals can access the files
-      string commonPath = TerminalInfoString(TERMINAL_COMMONDATA_PATH) + "\\";
+      string commonPath = TerminalInfoString(TERMINAL_COMMONDATA_PATH);
+      Print("Common data path: ", commonPath);
+      
+      // Ensure path ends with backslash
+      if(StringLen(commonPath) > 0 && StringGetCharacter(commonPath, StringLen(commonPath)-1) != '\\')
+         commonPath += "\\";
+      
       HEARTBEAT_FILE_PATH      = commonPath + "MT5com_heartbeat.txt";
       HEDGE_HEARTBEAT_FILE_PATH = commonPath + "MT5com_hedge_heartbeat.txt";
       COMM_FILE_PATH            = commonPath + "MT5com.txt";
       SignalFilePath            = commonPath + "Synergy_Signals.txt";
       
+      Print("File paths configured:");
+      Print("- HEARTBEAT_FILE_PATH: ", HEARTBEAT_FILE_PATH);
+      Print("- HEDGE_HEARTBEAT_FILE_PATH: ", HEDGE_HEARTBEAT_FILE_PATH);
+      Print("- COMM_FILE_PATH: ", COMM_FILE_PATH);
+      Print("- SignalFilePath: ", SignalFilePath);
+      
       // Test file access for heartbeat with FILE_COMMON flag
+      Print("Attempting to create heartbeat file...");
+      ResetLastError();
+      
       int fileHandle = FileOpen(HEARTBEAT_FILE_PATH, FILE_WRITE|FILE_TXT|FILE_COMMON);
       if(fileHandle != INVALID_HANDLE)
       {
-         FileWriteString(fileHandle, "MAIN_HEARTBEAT," + IntegerToString(Magic_Number) + "," + 
-                        IntegerToString(TimeCurrent()));
+         string heartbeatContent = "MAIN_HEARTBEAT," + IntegerToString(Magic_Number) + "," + 
+                        IntegerToString(TimeCurrent());
+         int writeResult = FileWriteString(fileHandle, heartbeatContent);
+         FileFlush(fileHandle);
          FileClose(fileHandle);
-         Print("File-based communication initialized. Magic: ", Magic_Number);
-         Print("Heartbeat file created: ", HEARTBEAT_FILE_PATH);
+         
+         Print("✅ SUCCESS: Heartbeat file created successfully!");
+         Print("   Content: ", heartbeatContent);
+         Print("   Bytes written: ", writeResult);
+         Print("   Magic: ", Magic_Number);
+         Print("   Path: ", HEARTBEAT_FILE_PATH);
+         
+         // Verify file was actually created
+         if(FileIsExist(HEARTBEAT_FILE_PATH, FILE_COMMON))
+         {
+            Print("✅ VERIFIED: File exists and is accessible");
+         }
+         else
+         {
+            Print("⚠️  WARNING: File created but not accessible via FileIsExist");
+         }
       }
       else
       {
          int errorCode = GetLastError();
-         Print("ERROR: Failed to create heartbeat file: ", errorCode);
-         Print("Path: ", HEARTBEAT_FILE_PATH);
-         Print("Will continue initialization - communication may be limited");
-         // Don't fail initialization - continue anyway
+         Print("❌ ERROR: Failed to create heartbeat file!");
+         Print("   Error Code: ", errorCode, " (", GetErrorDescription(errorCode), ")");
+         Print("   Path: ", HEARTBEAT_FILE_PATH);
+         Print("   Common Path: ", commonPath);
+         
+         // Try alternative path
+         Print("Trying alternative path without FILE_COMMON...");
+         string altPath = "MQL5\\Files\\MT5com_heartbeat.txt";
+         ResetLastError();
+         int altHandle = FileOpen(altPath, FILE_WRITE|FILE_TXT);
+         if(altHandle != INVALID_HANDLE)
+         {
+            FileWriteString(altHandle, "MAIN_HEARTBEAT," + IntegerToString(Magic_Number) + "," + 
+                           IntegerToString(TimeCurrent()));
+            FileFlush(altHandle);
+            FileClose(altHandle);
+            Print("✅ Alternative path worked: ", altPath);
+            
+            // 🔥 CRITICAL FIX: Update ALL paths to use the same directory
+            HEARTBEAT_FILE_PATH = altPath;
+            HEDGE_HEARTBEAT_FILE_PATH = "MQL5\\Files\\MT5com_hedge_heartbeat.txt";
+            COMM_FILE_PATH = "MQL5\\Files\\MT5com.txt";
+            SignalFilePath = "MQL5\\Files\\Synergy_Signals.txt";
+            
+            Print("🔄 UPDATED all file paths to use MQL5\\Files\\ directory:");
+            Print("   - HEARTBEAT_FILE_PATH: ", HEARTBEAT_FILE_PATH);
+            Print("   - HEDGE_HEARTBEAT_FILE_PATH: ", HEDGE_HEARTBEAT_FILE_PATH);
+            Print("   - COMM_FILE_PATH: ", COMM_FILE_PATH);
+            Print("   - SignalFilePath: ", SignalFilePath);
+         }
+         else
+         {
+            Print("❌ Alternative path also failed. Error: ", GetLastError(), " (", GetErrorDescription(GetLastError()), ")");
+         }
       }
+      
+      // Test signal file creation with potentially updated path
+      Print("Testing signal file creation...");
+      ResetLastError();
+      
+      // Use appropriate flags based on which path we're using
+      bool useFileCommon = (StringFind(COMM_FILE_PATH, "Common") >= 0);
+      int signalHandle = useFileCommon ? 
+                        FileOpen(COMM_FILE_PATH, FILE_WRITE|FILE_TXT|FILE_COMMON) :
+                        FileOpen(COMM_FILE_PATH, FILE_WRITE|FILE_TXT);
+      
+      if(signalHandle != INVALID_HANDLE)
+      {
+         FileWriteString(signalHandle, "TEST_SIGNAL,INIT," + IntegerToString(TimeCurrent()));
+         FileFlush(signalHandle);
+         FileClose(signalHandle);
+         Print("✅ Signal file test successful: ", COMM_FILE_PATH);
+      }
+      else
+      {
+         int error = GetLastError();
+         Print("❌ Signal file test failed. Error: ", error, " (", GetErrorDescription(error), ")");
+         
+         // If we're still using Common path and it failed, try MQL5\Files fallback
+         if(useFileCommon)
+         {
+            Print("Trying signal file with MQL5\\Files\\ fallback...");
+            string altSignalPath = "MQL5\\Files\\MT5com.txt";
+            ResetLastError();
+            int altSignalHandle = FileOpen(altSignalPath, FILE_WRITE|FILE_TXT);
+            if(altSignalHandle != INVALID_HANDLE)
+            {
+               FileWriteString(altSignalHandle, "TEST_SIGNAL,INIT," + IntegerToString(TimeCurrent()));
+               FileFlush(altSignalHandle);
+               FileClose(altSignalHandle);
+               Print("✅ Alternative signal file successful: ", altSignalPath);
+               COMM_FILE_PATH = altSignalPath;  // Update the path
+               
+               // Update SignalFilePath too for consistency
+               SignalFilePath = "MQL5\\Files\\Synergy_Signals.txt";
+               Print("Updated COMM_FILE_PATH and SignalFilePath to MQL5\\Files\\");
+            }
+            else
+            {
+               Print("❌ Alternative signal file also failed. Error: ", GetLastError(), " (", GetErrorDescription(GetLastError()), ")");
+            }
+         }
+      }
+   }
+   else if(EnableHedgeCommunication && CommunicationMethod == GLOBAL_VARS)
+   {
+      Print("Using GLOBAL_VARS communication method");
+   }
+   else if(!EnableHedgeCommunication)
+   {
+      Print("Hedge communication is DISABLED");
+   }
+   else
+   {
+      Print("❌ Unknown communication configuration!");
    }
    
    // Store initial balance
    initialBalance = AccountInfoDouble(ACCOUNT_BALANCE);
-   
-   // Calculate hedge factor
    hedgeFactor = MathMin(1.0, (ChallengeC * (1.0 + SlipBufD)) / MaxDD);
    
    // Initialize Session Filters
@@ -513,8 +1048,8 @@ int OnInit()
    // Enable entry triggers regardless of optional filters
    entryTriggersEnabled = true;
 
-
    // Set up hedge communication if enabled
+   Print("=== FINAL COMMUNICATION SETUP ===");
    if(EnableHedgeCommunication)
    {
       if(CommunicationMethod == GLOBAL_VARS)
@@ -522,7 +1057,7 @@ int OnInit()
          // Initialize the global variables for the hedge EA to find
          GlobalVariableSet("PROP_HB_" + IntegerToString(Magic_Number), (double)TimeCurrent());
          GlobalVariableSet("EASignal_Connected_"+IntegerToString(HedgeEA_Magic), (double)TimeCurrent());
-         Print("Hedge communication enabled (Global Variables). Target EA Magic: ", HedgeEA_Magic);
+         Print("✅ Hedge communication enabled (Global Variables). Target EA Magic: ", HedgeEA_Magic);
          Print("Main EA registered heartbeat with Magic: ", Magic_Number);
          Print("Main EA looking for hedge with Magic: ", HedgeEA_Magic);
          
@@ -537,12 +1072,18 @@ int OnInit()
       }
       else // FILE_BASED
       {
-         Print("File-based communication paths:");
+         Print("✅ File-based communication enabled. Target EA Magic: ", HedgeEA_Magic);
+         Print("File communication paths:");
          Print("- Main heartbeat: ", HEARTBEAT_FILE_PATH);
          Print("- Hedge heartbeat: ", HEDGE_HEARTBEAT_FILE_PATH);
          Print("- Signal file: ", COMM_FILE_PATH);
-         Print("Hedge communication enabled (File-Based). Target EA Magic: ", HedgeEA_Magic);
+         Print("- Additional signals: ", SignalFilePath);
+         Print("Communication ready with proper file handle management and synchronized paths");
       }
+   }
+   else
+   {
+      Print("❌ Hedge communication is DISABLED");
    }
 
    // Start heartbeat system
@@ -551,7 +1092,7 @@ int OnInit()
    linkWasOK = IsLinkAlive(true);
 
    // Print initial settings for verification
-   Print("SETTINGS VERIFICATION:");
+   Print("=== SETTINGS VERIFICATION ===");
    Print("UseFixedLot = ", UseFixedLot ? "TRUE" : "FALSE");
    Print("FixedLotSize = ", FixedLotSize);
    Print("RiskPercent = ", RiskPercent);
@@ -560,7 +1101,8 @@ int OnInit()
    Print("HedgeEA_Magic = ", HedgeEA_Magic);
    Print("EnableHedgeCommunication = ", EnableHedgeCommunication ? "TRUE" : "FALSE");
    Print("CommunicationMethod = ", CommunicationMethod == GLOBAL_VARS ? "GLOBAL_VARS" : "FILE_BASED");
-   Print("Synergy Strategy v1.02 initialised. Hedge factor:",DoubleToString(hedgeFactor,4));
+   Print("Synergy Strategy v1.04 initialised. Hedge factor:",DoubleToString(hedgeFactor,4));
+   Print("=== INITIALIZATION COMPLETED ===");
 
    return(INIT_SUCCEEDED);
 }
@@ -570,75 +1112,243 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   // 0) global guards
-   if(!EnableTrading)                      return;          // trading toggle
-   if(!IsMarketOpen())                     return;          // symbol halted
-   if(Bars(_Symbol,PERIOD_CURRENT)<BARS_REQUIRED) return;   // history warm-up
+   // === DEBUGGING SECTION START ===
+   static int debugCounter = 0;
+   static datetime lastDebugTime = 0;
+   debugCounter++;
+   
+   // Print basic status every 50 ticks or every 30 seconds
+   if(debugCounter % 50 == 0 || TimeCurrent() - lastDebugTime > 30) {
+      Print("=== BASIC STATUS CHECK #", debugCounter, " ===");
+      Print("Time: ", TimeToString(TimeCurrent()));
+      Print("EnableTrading: ", EnableTrading);
+      Print("IsMarketOpen: ", IsMarketOpen());
+      Print("Bars Available: ", Bars(_Symbol,PERIOD_CURRENT), " / Required: ", BARS_REQUIRED);
+      Print("Has Open Position: ", HasOpenPosition());
+      lastDebugTime = TimeCurrent();
+   }
+   
+   // 0) global guards with detailed logging
+   if(!EnableTrading) {
+      if(debugCounter % 100 == 0) Print("DEBUG: Trading disabled");
+      return;
+   }
+   if(!IsMarketOpen()) {
+      if(debugCounter % 100 == 0) Print("DEBUG: Market closed");
+      return;
+   }
+   if(Bars(_Symbol,PERIOD_CURRENT)<BARS_REQUIRED) {
+      if(debugCounter % 100 == 0) Print("DEBUG: Insufficient bars - Available: ", Bars(_Symbol,PERIOD_CURRENT), " Required: ", BARS_REQUIRED);
+      return;
+   }
 
    // 1) update dashboard & visuals every tick
    UpdateDashboard();
    if(ShowPivotLines)  DrawPivotLines();
    if(ShowMarketBias)  ShowMarketBiasIndicator();
 
-   // 2) only run heavy logic once per bar
+   // 2) CHECK FOR NEW BAR - CRITICAL FOR BAR CLOSE TRADING
    if(!IsNewBar()) return;
+   
+   // 3) WAIT FOR BAR CONFIRMATION - ONLY TRADE ON BAR CLOSE
+   if(!IsConfirmedBar())
+   {
+      static datetime lastBarWait = 0;
+      if(TimeCurrent() - lastBarWait > 30)
+      {
+         Print("DEBUG: Waiting for bar close confirmation...");
+         lastBarWait = TimeCurrent();
+      }
+      return;
+   }
 
-   // 3) pull fresh history – sized exactly to what the pivots need
+   Print("====================================================");
+   Print("=== BAR CLOSE ANALYSIS - ", TimeToString(TimeCurrent()), " ===");
+   Print("====================================================");
+   
+   // 4) pull fresh history with detailed logging
    int needBars = MathMax(PivotTPBars + PivotLengthLeft + PivotLengthRight + 5 , 100);
-   if(CopyClose(_Symbol,PERIOD_CURRENT,0,needBars,Close)        < needBars) return;
-   if(CopyOpen (_Symbol,PERIOD_CURRENT,0,needBars,Open )        < needBars) return;
-   if(CopyHigh (_Symbol,PERIOD_CURRENT,0,needBars,High )        < needBars) return;
-   if(CopyLow  (_Symbol,PERIOD_CURRENT,0,needBars,Low  )        < needBars) return;
-   if(CopyTime (_Symbol,PERIOD_CURRENT,0,needBars,TimeSeries)   < needBars) return;
+   Print("DEBUG: Need ", needBars, " bars for analysis");
+   
+   if(CopyClose(_Symbol,PERIOD_CURRENT,0,needBars,Close) < needBars) {
+      Print("ERROR: Failed to copy Close prices - got ", ArraySize(Close), " need ", needBars);
+      return;
+   }
+   if(CopyOpen(_Symbol,PERIOD_CURRENT,0,needBars,Open) < needBars) {
+      Print("ERROR: Failed to copy Open prices");
+      return;
+   }
+   if(CopyHigh(_Symbol,PERIOD_CURRENT,0,needBars,High) < needBars) {
+      Print("ERROR: Failed to copy High prices");
+      return;
+   }
+   if(CopyLow(_Symbol,PERIOD_CURRENT,0,needBars,Low) < needBars) {
+      Print("ERROR: Failed to copy Low prices");
+      return;
+   }
+   if(CopyTime(_Symbol,PERIOD_CURRENT,0,needBars,TimeSeries) < needBars) {
+      Print("ERROR: Failed to copy Time series");
+      return;
+   }
+   Print("DEBUG: Successfully copied price data - Arrays size: ", ArraySize(Close));
 
-   // 4) session filter
-   if(!IsInTradingSession())
-      { Print("Outside session");  return; }
+   // 5) session filter with logging
+   bool inSession = IsInTradingSession();
+   Print("DEBUG: Trading Session Check: ", inSession ? "IN SESSION" : "OUT OF SESSION");
+   if(!inSession) {
+      Print("DEBUG: Outside trading session - exiting");
+      return;
+   }
 
-   // 5) refresh indicators
+   // 6) refresh indicators ONLY ON BAR CLOSE
+   Print("--- INDICATOR CALCULATIONS (BAR CLOSE) ---");
+   double oldSynergyScore = synergyScore;
+   bool oldBiasPositive = currentBiasPositive;
+   bool oldBiasChangedToBullish = biasChangedToBullish;
+   bool oldBiasChangedToBearish = biasChangedToBearish;
+   bool oldAdxCondition = adxTrendCondition;
+   
    CalculateSynergyScore();
    CalculateMarketBias();
    CalculateADXFilter();
+   
+   Print("SYNERGY SCORE: ", DoubleToString(synergyScore, 3), " (was: ", DoubleToString(oldSynergyScore, 3), ") - Enabled: ", UseSynergyScore);
+   Print("MARKET BIAS: Current=", currentBiasPositive ? "BULLISH" : "BEARISH", " (was: ", oldBiasPositive ? "BULLISH" : "BEARISH", ") - Enabled: ", UseMarketBias);
+   Print("BIAS CHANGES: ToBullish=", biasChangedToBullish, " (was: ", oldBiasChangedToBullish, "), ToBearish=", biasChangedToBearish, " (was: ", oldBiasChangedToBearish, ")");
+   Print("ADX TREND: ", adxTrendCondition ? "TRUE" : "FALSE", " (was: ", oldAdxCondition ? "TRUE" : "FALSE", ") - Enabled: ", EnableADXFilter);
+   if(EnableADXFilter) Print("ADX Threshold: ", DoubleToString(effectiveADXThreshold, 2));
 
-   // 6) derive swing-pivots
-   double slLong  = FindDeepestPivotLowBelowClose (PivotTPBars);
-   double tpLong  = FindHighestPivotHighAboveClose(PivotTPBars);
-   double slShort = FindHighestPivotHighAboveClose(PivotTPBars);
-   double tpShort = FindDeepestPivotLowBelowClose (PivotTPBars);
+   // 7) derive swing-pivots with detailed logging and selection criteria
+   Print("--- PIVOT CALCULATION ---");
+   Print("Pivot Selection Criteria:");
+   Print("  LONG SL  = DEEPEST pivot low BELOW current price (within ", PivotTPBars, " bars)");
+   Print("  LONG TP  = HIGHEST pivot high ABOVE current price (within ", PivotTPBars, " bars)");
+   Print("  SHORT SL = HIGHEST pivot high ABOVE current price (within ", PivotTPBars, " bars)");
+   Print("  SHORT TP = DEEPEST pivot low BELOW current price (within ", PivotTPBars, " bars)");
+   
+   double slLong  = FindDeepestPivotLowBelowClose(PivotTPBars);   // Deepest (lowest) pivot low below price
+   double tpLong  = FindHighestPivotHighAboveClose(PivotTPBars);  // Highest pivot high above price
+   double slShort = FindHighestPivotHighAboveClose(PivotTPBars);  // Highest pivot high above price  
+   double tpShort = FindDeepestPivotLowBelowClose(PivotTPBars);   // Deepest (lowest) pivot low below price
+
+   Print("Current Price: ", DoubleToString(Close[0], 5));
+   Print("SELECTED PIVOTS:");
+   Print("  LONG  - SL: ", DoubleToString(slLong, 5), " (DEEPEST low below, valid: ", (slLong > 0 && slLong < Close[0]) ? "YES" : "NO", ")");
+   Print("  LONG  - TP: ", DoubleToString(tpLong, 5), " (HIGHEST high above, valid: ", (tpLong > 0 && tpLong > Close[0]) ? "YES" : "NO", ")");
+   Print("  SHORT - SL: ", DoubleToString(slShort, 5), " (HIGHEST high above, valid: ", (slShort > 0 && slShort > Close[0]) ? "YES" : "NO", ")");
+   Print("  SHORT - TP: ", DoubleToString(tpShort, 5), " (DEEPEST low below, valid: ", (tpShort > 0 && tpShort < Close[0]) ? "YES" : "NO", ")");
+
+   // NO FALLBACK - Strategy requires valid pivot points only
+   bool hasValidLongPivots = (slLong > 0 && slLong < Close[0] && tpLong > 0 && tpLong > Close[0]);
+   bool hasValidShortPivots = (slShort > 0 && slShort > Close[0] && tpShort > 0 && tpShort < Close[0]);
+   
+   if(!hasValidLongPivots && !hasValidShortPivots)
+   {
+      Print("DEBUG: No valid pivot combinations found - NO TRADE (Strategy requires strict pivot SL/TP)");
+   }
+   else if(!hasValidLongPivots)
+   {
+      Print("DEBUG: No valid LONG pivot combination (SL:", DoubleToString(slLong,5), " TP:", DoubleToString(tpLong,5), ")");
+   }
+   else if(!hasValidShortPivots)
+   {
+      Print("DEBUG: No valid SHORT pivot combination (SL:", DoubleToString(slShort,5), " TP:", DoubleToString(tpShort,5), ")");
+   }
+
+   // Draw pivot lines on chart
+   DrawDetectedPivotLines();
 
    if(slLong  >0) pivotStopLongEntry  = slLong;
    if(tpLong  >0) pivotTpLongEntry    = tpLong;
    if(slShort >0) pivotStopShortEntry = slShort;
    if(tpShort >0) pivotTpShortEntry   = tpShort;
 
-   // 7) build entry conditions
-   bool longCond =
-       IsConfirmedBar() &&
-       entryTriggersEnabled          &&
-       adxTrendCondition             &&
-       (UseSynergyScore ? synergyScore>0 : true) &&
-       (UseMarketBias  ? biasChangedToBullish : true) &&
-       slLong  >0 && slLong  < Close[0] &&
-       tpLong  >0 && tpLong  > Close[0] &&
-       IsInTradingSession();
+   // 8) build entry conditions with detailed breakdown
+   Print("--- ENTRY CONDITIONS ANALYSIS ---");
+   
+   // Common conditions
+   bool confirmedBar = true; // We already checked this above
+   bool hasPosition = HasOpenPosition();
+   bool inSessionCheck2 = IsInTradingSession(); // Double check
+   
+   Print("COMMON CONDITIONS:");
+   Print("  ✓ Bar Close Confirmed: TRUE");
+   Print("  ✓ Entry Triggers Enabled: ", entryTriggersEnabled ? "TRUE" : "FALSE");
+   Print("  ✓ ADX Trend Condition: ", adxTrendCondition ? "TRUE" : "FALSE");
+   Print("  ✓ In Trading Session: ", inSessionCheck2 ? "TRUE" : "FALSE");
+   Print("  ✓ No Open Position: ", !hasPosition ? "TRUE" : "FALSE");
+   
+   // Long conditions breakdown
+   bool longSynergyOK = UseSynergyScore ? synergyScore>0 : true;
+   bool longBiasOK = UseMarketBias ? biasChangedToBullish : true; // Keep original logic as requested
+   bool longPivotSLOK = slLong > 0 && slLong < Close[0];
+   bool longPivotTPOK = tpLong > 0 && tpLong > Close[0];
+   
+   Print("LONG CONDITIONS:");
+   Print("  ✓ Synergy OK: ", longSynergyOK ? "TRUE" : "FALSE", " (Score: ", DoubleToString(synergyScore, 3), ", Required: >0, Enabled: ", UseSynergyScore, ")");
+   Print("  ✓ Bias OK: ", longBiasOK ? "TRUE" : "FALSE", " (ChangedToBullish: ", biasChangedToBullish, ", Enabled: ", UseMarketBias, ")");
+   Print("  ✓ Pivot SL OK: ", longPivotSLOK ? "TRUE" : "FALSE", " (", DoubleToString(slLong, 5), " < ", DoubleToString(Close[0], 5), ")");
+   Print("  ✓ Pivot TP OK: ", longPivotTPOK ? "TRUE" : "FALSE", " (", DoubleToString(tpLong, 5), " > ", DoubleToString(Close[0], 5), ")");
 
-   bool shortCond =
-       IsConfirmedBar() &&
-       entryTriggersEnabled          &&
-       adxTrendCondition             &&
-       (UseSynergyScore ? synergyScore<0 : true) &&
-       (UseMarketBias  ? biasChangedToBearish : true) &&
-       slShort >0 && slShort > Close[0] &&
-       tpShort >0 && tpShort < Close[0] &&
-       IsInTradingSession();
+   bool longCond = confirmedBar && entryTriggersEnabled && adxTrendCondition && 
+                   longSynergyOK && longBiasOK && longPivotSLOK && longPivotTPOK && 
+                   inSessionCheck2 && !hasPosition;
+   
+   // Short conditions breakdown
+   bool shortSynergyOK = UseSynergyScore ? synergyScore<0 : true;
+   bool shortBiasOK = UseMarketBias ? biasChangedToBearish : true; // Keep original logic as requested
+   bool shortPivotSLOK = slShort > 0 && slShort > Close[0];
+   bool shortPivotTPOK = tpShort > 0 && tpShort < Close[0];
+   
+   Print("SHORT CONDITIONS:");
+   Print("  ✓ Synergy OK: ", shortSynergyOK ? "TRUE" : "FALSE", " (Score: ", DoubleToString(synergyScore, 3), ", Required: <0, Enabled: ", UseSynergyScore, ")");
+   Print("  ✓ Bias OK: ", shortBiasOK ? "TRUE" : "FALSE", " (ChangedToBearish: ", biasChangedToBearish, ", Enabled: ", UseMarketBias, ")");
+   Print("  ✓ Pivot SL OK: ", shortPivotSLOK ? "TRUE" : "FALSE", " (", DoubleToString(slShort, 5), " > ", DoubleToString(Close[0], 5), ")");
+   Print("  ✓ Pivot TP OK: ", shortPivotTPOK ? "TRUE" : "FALSE", " (", DoubleToString(tpShort, 5), " < ", DoubleToString(Close[0], 5), ")");
 
-   // 8) execute
-   if(longCond  && !HasOpenPosition()) OpenTrade(true , slLong , tpLong );
-   if(shortCond && !HasOpenPosition()) OpenTrade(false, slShort, tpShort);
+   bool shortCond = confirmedBar && entryTriggersEnabled && adxTrendCondition && 
+                    shortSynergyOK && shortBiasOK && shortPivotSLOK && shortPivotTPOK && 
+                    inSessionCheck2 && !hasPosition;
 
-   // 9) manage & bleed
+   Print("--- FINAL RESULTS ---");
+   Print("LONG CONDITION RESULT: ", longCond ? "✓ TRUE - TRADE SIGNAL!" : "✗ FALSE");
+   Print("SHORT CONDITION RESULT: ", shortCond ? "✓ TRUE - TRADE SIGNAL!" : "✗ FALSE");
+   
+   if(!longCond && !shortCond) {
+      Print("❌ NO TRADE SIGNALS - Check failed conditions above");
+      
+      // Identify the most likely blockers
+      if(!entryTriggersEnabled) Print("🚫 BLOCKER: Entry triggers disabled");
+      if(!adxTrendCondition && EnableADXFilter) Print("🚫 BLOCKER: ADX condition failed");
+      if(hasPosition) Print("🚫 BLOCKER: Position already open");
+      if(!inSessionCheck2) Print("🚫 BLOCKER: Outside trading session");
+      if(UseMarketBias && !biasChangedToBullish && !biasChangedToBearish) Print("🚫 BLOCKER: Market bias not changing (waiting for bias shift)");
+      if(!hasValidLongPivots && !hasValidShortPivots) Print("🚫 BLOCKER: No valid pivot SL/TP combinations found (strict pivot strategy)");
+   }
+
+   // 9) execute with enhanced logging - ONLY ON BAR CLOSE
+   if(longCond && !HasOpenPosition()) {
+      Print("🚀 EXECUTING LONG TRADE ON BAR CLOSE!");
+      Print("   Entry Price: ~", DoubleToString(Close[0], 5));
+      Print("   Stop Loss: ", DoubleToString(slLong, 5));
+      Print("   Take Profit: ", DoubleToString(tpLong, 5));
+      Print("   Using Fallback Levels: NO - Strict pivot strategy");
+      OpenTrade(true, slLong, tpLong);
+   }
+   if(shortCond && !HasOpenPosition()) {
+      Print("🚀 EXECUTING SHORT TRADE ON BAR CLOSE!");
+      Print("   Entry Price: ~", DoubleToString(Close[0], 5));
+      Print("   Stop Loss: ", DoubleToString(slShort, 5));
+      Print("   Take Profit: ", DoubleToString(tpShort, 5));
+      Print("   Using Fallback Levels: NO - Strict pivot strategy");
+      OpenTrade(false, slShort, tpShort);
+   }
+
+   // 10) manage & bleed
    ManageOpenPositions();
    CheckBleedCondition();
+   
+   Print("====================================================");
 }
 
 //+------------------------------------------------------------------+
@@ -952,264 +1662,6 @@ bool IsTimeInSession(datetime serverTime, string sessionTime)
    }
 }
 
-//+------------------------------------------------------------------+
-//| Manage open positions (scale-out, breakeven, trailing)           |
-//+------------------------------------------------------------------+
-void ManageOpenPositions()
-{
-   // Get current position
-   if(!PositionSelect(_Symbol)) return;
-   
-   // Check if the position belongs to this EA
-   if(PositionGetInteger(POSITION_MAGIC) != Magic_Number) return;
-   
-   double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-   double positionVolume = PositionGetDouble(POSITION_VOLUME);
-   ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-   
-   // LONG position management
-   if(posType == POSITION_TYPE_BUY)
-   {
-      double distInPips = (Close[0] - entryPrice) / GetPipSize();
-      
-      // Scale-out logic for long positions
-      if(EnableScaleOut && ScaleOut1Enabled && !scaleOut1LongTriggered && pivotTpLongEntry > 0)
-      {
-         // Calculate scale-out price at specified percentage of the target distance
-         double scaleOut1Price = entryPrice + ((pivotTpLongEntry - entryPrice) * ScaleOut1Pct / 100.0);
-         
-         // Execute scale-out when price reaches the level
-         if(Close[0] >= scaleOut1Price)
-         {
-            scaleOut1LongTriggered = true;
-            double partialQty = positionVolume * (ScaleOut1Size / 100.0);
-            
-            if(trade.PositionClosePartial(PositionGetTicket(0), partialQty))
-            {
-               Print("Long position scaled out. Closed: ", DoubleToString(partialQty, 2), 
-                     " at price: ", DoubleToString(Close[0], 5));
-               
-               // Set breakeven if enabled
-               if(ScaleOut1BE && !beAppliedLong && pivotStopLongEntry < entryPrice)
-               {
-                  beAppliedLong = true;
-                  pivotStopLongEntry = entryPrice;
-                  
-                  if(trade.PositionModify(PositionGetTicket(0), entryPrice, pivotTpLongEntry))
-                  {
-                     Print("Long position SL moved to breakeven after scale-out");
-                     
-                     // Signal hedge EA about stop adjustment
-                        if(EnableHedgeCommunication)
-                     {
-                        SendHedgeSignal("MODIFY", "SELL", 0, pivotTpLongEntry, entryPrice);
-                        Print("Hedge modify signal sent: SL adjusted to ", DoubleToString(entryPrice, 5));
-                     }
-                  }
-               }
-               
-               // Signal hedge EA about scale-out
-               if(EnableHedgeCommunication)
-               {
-                  double hedgeScaleOutLots = NormalizeLots(partialQty * hedgeFactor);
-                  SendHedgeSignal("PARTIAL_CLOSE", "SELL", hedgeScaleOutLots, 0, 0);
-                  Print("Hedge partial close signal sent: SELL ", DoubleToString(hedgeScaleOutLots, 2));
-               }
-            }
-         }
-      }
-      
-      // Regular breakeven (separate from scale-out)
-      if(EnableBreakEven && !beAppliedLong && distInPips >= BeTriggerPips)
-      {
-         beAppliedLong = true;
-         double newSL = entryPrice;
-         
-         if(trade.PositionModify(PositionGetTicket(0), newSL, pivotTpLongEntry))
-         {
-            Print("Long position SL moved to breakeven: ", DoubleToString(newSL, 5));
-            pivotStopLongEntry = newSL;
-            
-            // Signal hedge EA about stop adjustment
-            if(EnableHedgeCommunication)
-            {
-               SendHedgeSignal("MODIFY", "SELL", 0, pivotTpLongEntry, newSL);
-               Print("Hedge modify signal sent: SL adjusted to ", DoubleToString(newSL, 5));
-            }
-         }
-      }
-      
-      // Update stop loss if necessary
-      if(pivotStopLongEntry > 0 && pivotStopLongEntry != PositionGetDouble(POSITION_SL))
-      {
-         if(trade.PositionModify(PositionGetTicket(0), pivotStopLongEntry, pivotTpLongEntry))
-         {
-            Print("Long position SL/TP updated: SL=", DoubleToString(pivotStopLongEntry, 5), 
-                  ", TP=", DoubleToString(pivotTpLongEntry, 5));
-         }
-      }
-   }
-   
-   // SHORT position management
-   if(posType == POSITION_TYPE_SELL)
-   {
-      double distInPips = (entryPrice - Close[0]) / GetPipSize();
-      
-      // Scale-out logic for short positions
-      if(EnableScaleOut && ScaleOut1Enabled && !scaleOut1ShortTriggered && pivotTpShortEntry > 0)
-      {
-         // Calculate scale-out price at specified percentage of the target distance
-         double scaleOut1Price = entryPrice - ((entryPrice - pivotTpShortEntry) * ScaleOut1Pct / 100.0);
-         
-         // Execute scale-out when price reaches the level
-         if(Close[0] <= scaleOut1Price)
-         {
-            scaleOut1ShortTriggered = true;
-            double partialQty = positionVolume * (ScaleOut1Size / 100.0);
-            
-            if(trade.PositionClosePartial(PositionGetTicket(0), partialQty))
-            {
-               Print("Short position scaled out. Closed: ", DoubleToString(partialQty, 2), 
-                     " at price: ", DoubleToString(Close[0], 5));
-               
-               // Set breakeven if enabled
-               if(ScaleOut1BE && !beAppliedShort && pivotStopShortEntry > entryPrice)
-               {
-                  beAppliedShort = true;
-                  pivotStopShortEntry = entryPrice;
-                  
-                  if(trade.PositionModify(PositionGetTicket(0), entryPrice, pivotTpShortEntry))
-                  {
-                     Print("Short position SL moved to breakeven after scale-out");
-                     
-                     // Signal hedge EA about stop adjustment
-                     if(EnableHedgeCommunication)
-                     {
-                        SendHedgeSignal("MODIFY", "BUY", 0, pivotTpShortEntry, entryPrice);
-                        Print("Hedge modify signal sent: SL adjusted to ", DoubleToString(entryPrice, 5));
-                     }
-                  }
-               }
-               
-               // Signal hedge EA about scale-out
-               if(EnableHedgeCommunication)
-               {
-                  double hedgeScaleOutLots = NormalizeLots(partialQty * hedgeFactor);
-                  SendHedgeSignal("PARTIAL_CLOSE", "BUY", hedgeScaleOutLots, 0, 0);
-                  Print("Hedge partial close signal sent: BUY ", DoubleToString(hedgeScaleOutLots, 2));
-               }
-            }
-         }
-      }
-      
-      // Regular breakeven (separate from scale-out)
-      if(EnableBreakEven && !beAppliedShort && distInPips >= BeTriggerPips)
-      {
-         beAppliedShort = true;
-         double newSL = entryPrice;
-         
-         if(trade.PositionModify(PositionGetTicket(0), newSL, pivotTpShortEntry))
-         {
-            Print("Short position SL moved to breakeven: ", DoubleToString(newSL, 5));
-            pivotStopShortEntry = newSL;
-            
-            // Signal hedge EA about stop adjustment
-            if(EnableHedgeCommunication)
-            {
-               SendHedgeSignal("MODIFY", "BUY", 0, pivotTpShortEntry, newSL);
-               Print("Hedge modify signal sent: SL adjusted to ", DoubleToString(newSL, 5));
-            }
-         }
-      }
-      
-      // Update stop loss if necessary
-      if(pivotStopShortEntry > 0 && pivotStopShortEntry != PositionGetDouble(POSITION_SL))
-      {
-         if(trade.PositionModify(PositionGetTicket(0), pivotStopShortEntry, pivotTpShortEntry))
-         {
-            Print("Short position SL/TP updated: SL=", DoubleToString(pivotStopShortEntry, 5), 
-                  ", TP=", DoubleToString(pivotTpShortEntry, 5));
-         }
-      }
-   }
-}
-
-//+------------------------------------------------------------------+
-//| Generic order opener (replaces the long / short duplication)     |
-//+------------------------------------------------------------------+
-void OpenTrade(bool isLong, const double sl, const double tp)
-{
-   double slAdj = sl;
-   double tpAdj = tp;
-   EnsureValidStops(isLong, slAdj, tpAdj);
-
-   // Fail-safe: never open a trade without valid stops
-   if(slAdj <= 0 || tpAdj <= 0)
-   {
-      Print("OpenTrade(): invalid SL/TP - trade aborted");
-      return;
-   }
-
-   //––– lot-size
-   double slPips = MathAbs(Close[0]-slAdj) / GetPipSize();
-   
-   Print("OpenTrade: UseFixedLot=", UseFixedLot, ", FixedLotSize=", FixedLotSize, ", RiskPercent=", RiskPercent);
-   
-   double rawLots;
-   if(UseFixedLot) {
-      rawLots = FixedLotSize;
-      Print("Using fixed lot size: ", FixedLotSize);
-   } else {
-      rawLots = CalculatePositionSize(slPips, RiskPercent);
-      Print("Using risk-based lot size: ", rawLots, " (SL pips: ", slPips, ", Risk%: ", RiskPercent, ")");
-   }
-   
-   double lots = NormalizeLots(rawLots);
-   Print("Final normalized lot size: ", lots);
-
-   //––– hedge volume
-   double lotLive = NormalizeLots(lots * hedgeFactor);
-
-   // record for later
-   lastEntryLots = lots;
-   hedgeLotsLast = lotLive;
-
-   //––– place main order
-   bool ok = isLong
-             ? trade.Buy(lots, _Symbol, 0, slAdj, tpAdj, "Long")
-             : trade.Sell(lots, _Symbol, 0, slAdj, tpAdj, "Short");
-
-   if(!ok) { 
-      Print("OpenTrade(): order failed – ", GetLastError());
-      return;
-   }
-
-   // reset per-side flags
-   if(isLong) { scaleOut1LongTriggered = false; beAppliedLong = false; }
-   else { scaleOut1ShortTriggered = false; beAppliedShort = false; }
-
-   //––– fire hedge order
-   if(EnableHedgeCommunication)
-      SendHedgeSignal("OPEN", isLong? "SELL":"BUY", lotLive, tpAdj, slAdj);
-}
-
-
-//+------------------------------------------------------------------+
-//| One-liner wrapper for bleed logic                                |
-//+------------------------------------------------------------------+
-void CheckBleedCondition()
-{
-   double curProfit = AccountInfoDouble(ACCOUNT_BALANCE) - initialBalance;
-
-   if(!bleedDone &&
-      curProfit >= StageTarget*0.70 &&
-      EnableHedgeCommunication)
-   {
-      bleedDone = true;
-      SendHedgeBleedSignal();
-      Print("Hedge bleed signal sent – 70 % of stage target reached");
-   }
-}
 
 //────────────────────────────────────────────────────────────────────
 // 4.  PIVOT‑SCAN FUNCTIONS  (fully replaced)                       
@@ -2300,21 +2752,128 @@ bool IsNewBar()
 //+------------------------------------------------------------------+
 //| Check if bar is confirmed (not still forming)                    |
 //+------------------------------------------------------------------+
-// used by IsConfirmedBar()
 bool IsConfirmedBar()
 {
-   // Ensure we reference the *previous* bar so it is fully closed when
-   // this function is called on the first tick of a new bar. Using index 0
-   // prevented any confirmation because TimeSeries[0] is the current bar
-   // start time. As a result the EA always detected an unconfirmed bar and
-   // skipped trading. We now check TimeSeries[1] which represents the last
-   // completed bar.
+   static datetime lastBarTime = 0;
+   datetime currentBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+   
+   // Check if we have enough history
    if(ArraySize(TimeSeries) < 2)
       return false;
-
-   datetime prevBarTime = TimeSeries[1];
-   return (TimeCurrent() - prevBarTime) >= PeriodSeconds();
+   
+   // Method 1: Check if we're in a new bar (just after previous bar closed)
+   if(lastBarTime != currentBarTime)
+   {
+      lastBarTime = currentBarTime;
+      // We're at the start of a new bar, so previous bar is confirmed closed
+      Print("DEBUG: New bar detected at ", TimeToString(currentBarTime), " - previous bar confirmed closed");
+      return true;
+   }
+   
+   / Method 2: Alternative - check if current bar is near close (last 10 seconds)
+   datetime nextBarTime = currentBarTime + PeriodSeconds();
+   int secondsUntilClose = (int)(nextBarTime - TimeCurrent());
+   
+   if(secondsUntilClose <= 10) // Last 10 seconds of current bar
+   {
+      static datetime lastNearCloseWarning = 0;
+      if(TimeCurrent() - lastNearCloseWarning > 30)
+      {
+         Print("DEBUG: Near bar close - ", secondsUntilClose, " seconds until next bar");
+         lastNearCloseWarning = TimeCurrent();
+      }
+      return true;
+   }
+   
+   return false;
 }
+//+------------------------------------------------------------------+
+//| Cleanup any potentially open file handles                        |
+//+------------------------------------------------------------------+
+void CleanupFileHandles()
+{
+   // Force garbage collection
+   // This is a workaround for potential handle leaks
+   static datetime lastCleanup = 0;
+   if(TimeCurrent() - lastCleanup > 5) // Only every 5 seconds
+   {
+      // Try to close any handles that might be stuck
+      for(int i = 0; i < 100; i++) // Arbitrary range
+      {
+         // This will fail silently for invalid handles
+         FileClose(i);
+      }
+      lastCleanup = TimeCurrent();
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Get human-readable error description                             |
+//+------------------------------------------------------------------+
+string GetErrorDescription(int errorCode)
+{
+   switch(errorCode)
+   {
+      case 0:     return "ERR_SUCCESS";
+      case 4001:  return "ERR_FUNCTION_NOT_CONFIRMED";
+      case 5002:  return "ERR_FILE_TOO_MANY_OPENED";
+      case 5003:  return "ERR_FILE_WRONG_FILENAME";
+      case 5004:  return "ERR_FILE_TOO_LONG_FILENAME";
+      case 5005:  return "ERR_FILE_CANNOT_OPEN";
+      case 5006:  return "ERR_FILE_BUFFER_ALLOCATION_ERROR";
+      case 5007:  return "ERR_FILE_CANNOT_DELETE";
+      case 5008:  return "ERR_FILE_INVALID_HANDLE";
+      case 5009:  return "ERR_FILE_WRONG_HANDLE";
+      case 5010:  return "ERR_FILE_NOT_TOWRITE";
+      case 5011:  return "ERR_FILE_NOT_TOREAD";
+      case 5012:  return "ERR_FILE_NOT_BIN";
+      case 5013:  return "ERR_FILE_NOT_TXT";
+      case 5014:  return "ERR_FILE_NOT_TXTORCSV";
+      case 5015:  return "ERR_FILE_NOT_CSV";
+      case 5016:  return "ERR_FILE_READ_ERROR";
+      case 5017:  return "ERR_FILE_WRITE_ERROR";
+      case 5018:  return "ERR_FILE_BIN_STRINGSIZE";
+      case 5019:  return "ERR_FILE_INCOMPATIBLE";
+      case 5020:  return "ERR_FILE_IS_DIRECTORY";
+      default:    return "Unknown error " + IntegerToString(errorCode);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Try alternative signal method as last resort                     |
+//+------------------------------------------------------------------+
+void TryAlternativeSignalMethod(string signalData)
+{
+   Print("🔄 Trying alternative signal method...");
+   
+   // Try using MQL5\\Files\\ path instead of common
+   string altPath = "MQL5\\Files\\MT5com.txt";
+   
+   ResetLastError();
+   int fileHandle = FileOpen(altPath, FILE_WRITE|FILE_TXT);
+   if(fileHandle != INVALID_HANDLE)
+   {
+      FileWriteString(fileHandle, signalData);
+      FileFlush(fileHandle);
+      FileClose(fileHandle);
+      
+      Print("✅ Alternative signal method succeeded: ", altPath);
+      COMM_FILE_PATH = altPath; // Update path for future use
+   }
+   else
+   {
+      int error = GetLastError();
+      Print("❌ Alternative signal method also failed. Error: ", error, " (", GetErrorDescription(error), ")");
+      
+      // Final fallback - try global variables as emergency
+      Print("🚨 Emergency fallback to Global Variables...");
+      string magicStr = IntegerToString(HedgeEA_Magic);
+      GlobalVariableSet("EASignal_Emergency_" + magicStr, (double)TimeCurrent());
+      GlobalVariableSet("EASignal_Data_" + magicStr, (double)StringGetTickCount(signalData));
+      Print("Emergency signal sent via Global Variables");
+   }
+}
+
 //+------------------------------------------------------------------+
 //| Check if market is open                                          |
 //+------------------------------------------------------------------+
@@ -2424,31 +2983,6 @@ double NormalizeLots(double lots)
 }
 
 //+------------------------------------------------------------------+
-//| Ensure SL and TP comply with minimum stop distance                |
-//+------------------------------------------------------------------+
-void EnsureValidStops(bool isLong,double &sl,double &tp)
-{
-   double stopPts = SymbolInfoInteger(_Symbol,SYMBOL_TRADE_STOPS_LEVEL);
-   double minDist = stopPts*_Point;
-   double price   = isLong ? SymbolInfoDouble(_Symbol,SYMBOL_ASK)
-                           : SymbolInfoDouble(_Symbol,SYMBOL_BID);
-
-   if(isLong)
-   {
-      if(sl<=0 || price-sl<minDist) sl=price-minDist;
-      if(tp<=0 || tp-price<minDist) tp=price+minDist;
-   }
-   else
-   {
-      if(sl<=0 || sl-price<minDist) sl=price+minDist;
-      if(tp<=0 || price-tp<minDist) tp=price-minDist;
-   }
-
-   sl=NormalizeDouble(sl,_Digits);
-   tp=NormalizeDouble(tp,_Digits);
-}
-
-//+------------------------------------------------------------------+
 //| Calculate total volume of open positions                          |
 //+------------------------------------------------------------------+
 double CalculateTotalVolume()
@@ -2500,7 +3034,55 @@ double CalculateDailyPnL()
 
 void SendHedgeSignal(string signalType, string direction, double volume, double tp, double sl)
 {
-   if(!EnableHedgeCommunication) return;
+   if(!EnableHedgeCommunication) 
+   {
+      Print("DEBUG: SendHedgeSignal called but communication disabled");
+      return;
+   }
+   
+   // CRITICAL FIX: Adjust SL/TP for hedge direction
+   double adjustedSL = sl;
+   double adjustedTP = tp;
+   
+   if(signalType == "OPEN")
+   {
+      double currentPrice = Close[0];
+      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      
+      Print("=== HEDGE SIGNAL ADJUSTMENT ===");
+      Print("Main trade SL: ", DoubleToString(sl, 5), " TP: ", DoubleToString(tp, 5));
+      Print("Current Ask: ", DoubleToString(ask, 5), " Bid: ", DoubleToString(bid, 5));
+      Print("Hedge Direction: ", direction);
+      
+      if(direction == "SELL") // Hedge for LONG main trade
+      {
+         // For hedge SELL: SL should be above entry, TP should be below entry
+         // We need to ensure SL > current price and TP < current price
+         if(sl < bid) // Original SL is below current price (from LONG trade)
+         {
+            // Swap: Use main TP as hedge SL, main SL as hedge TP
+            adjustedSL = tp;  // Main TP becomes hedge SL (above price)
+            adjustedTP = sl;  // Main SL becomes hedge TP (below price)
+            Print("🔄 HEDGE SELL: Swapped SL/TP");
+            Print("   Adjusted SL: ", DoubleToString(adjustedSL, 5), " (was TP)");
+            Print("   Adjusted TP: ", DoubleToString(adjustedTP, 5), " (was SL)");
+         }
+      }
+      else if(direction == "BUY") // Hedge for SHORT main trade
+      {
+         // For hedge BUY: SL should be below entry, TP should be above entry
+         if(sl > ask) // Original SL is above current price (from SHORT trade)
+         {
+            // Swap: Use main TP as hedge SL, main SL as hedge TP
+            adjustedSL = tp;  // Main TP becomes hedge SL (below price)
+            adjustedTP = sl;  // Main SL becomes hedge TP (above price)
+            Print("🔄 HEDGE BUY: Swapped SL/TP");
+            Print("   Adjusted SL: ", DoubleToString(adjustedSL, 5), " (was TP)");
+            Print("   Adjusted TP: ", DoubleToString(adjustedTP, 5), " (was SL)");
+         }
+      }
+   }
    
    if(CommunicationMethod == GLOBAL_VARS)
    {
@@ -2509,58 +3091,99 @@ void SendHedgeSignal(string signalType, string direction, double volume, double 
       GlobalVariableSet("EASignal_Type_" + magicStr, (double)StringGetTickCount(signalType));
       GlobalVariableSet("EASignal_Direction_" + magicStr, (double)StringGetTickCount(direction));
       GlobalVariableSet("EASignal_Volume_" + magicStr, volume);
-      GlobalVariableSet("EASignal_SL_" + magicStr, sl);
-      GlobalVariableSet("EASignal_TP_" + magicStr, tp);
+      GlobalVariableSet("EASignal_SL_" + magicStr, adjustedSL);
+      GlobalVariableSet("EASignal_TP_" + magicStr, adjustedTP);
       GlobalVariableSet("EASignal_Time_" + magicStr, (double)TimeCurrent());
       
-      Print("Signal sent to hedge EA: ", signalType, " ", direction, " ", 
-            DoubleToString(volume, 2), " lots, TP: ", DoubleToString(tp, 5), 
-            ", SL: ", DoubleToString(sl, 5));
+      Print("✅ Signal sent via GLOBAL_VARS: ", signalType, " ", direction, " ", 
+            DoubleToString(volume, 2), " lots, TP: ", DoubleToString(adjustedTP, 5), 
+            ", SL: ", DoubleToString(adjustedSL, 5));
    }
    else // FILE_BASED
    {
-      // Create a signal string with all parameters
+      // Create a signal string with ADJUSTED parameters
       string signalData = signalType + "," + 
                         direction + "," + 
                         DoubleToString(volume, 2) + "," + 
-                        DoubleToString(tp, 5) + "," + 
-                        DoubleToString(sl, 5) + "," + 
+                        DoubleToString(adjustedTP, 5) + "," + 
+                        DoubleToString(adjustedSL, 5) + "," + 
                         IntegerToString(Magic_Number) + "," +
                         IntegerToString(TimeCurrent());
       
-      Print("SENDING SIGNAL: ", signalData);  // Debug signal transmission
+      Print("📤 SENDING FILE SIGNAL: ", signalData);
+      Print("   File path: ", COMM_FILE_PATH);
+      
+      // Force close any potentially open handles first
+      CleanupFileHandles();
       
       // Try to write the signal file with retries
       bool success = false;
       for(int attempt = 1; attempt <= FILE_WRITE_RETRY && !success; attempt++)
       {
-         int fileHandle = FileOpen(COMM_FILE_PATH, FILE_WRITE|FILE_TXT|FILE_COMMON);
+         Print("   Attempt ", attempt, " of ", FILE_WRITE_RETRY);
+         
+         // Reset last error before attempting
+         ResetLastError();
+         
+         int fileHandle = INVALID_HANDLE;
+         
+         // Use appropriate flags based on which path we're using
+         bool useFileCommon = (StringFind(COMM_FILE_PATH, "Common") >= 0);
+         fileHandle = useFileCommon ? 
+                     FileOpen(COMM_FILE_PATH, FILE_WRITE|FILE_TXT|FILE_COMMON) :
+                     FileOpen(COMM_FILE_PATH, FILE_WRITE|FILE_TXT);
+         
          if(fileHandle != INVALID_HANDLE)
          {
-            FileWriteString(fileHandle, signalData);
-            FileClose(fileHandle);
-            success = true;
+            // Successfully opened file
+            int writeResult = FileWriteString(fileHandle, signalData);
+            FileFlush(fileHandle);  // Force write to disk
+            FileClose(fileHandle);  // Always close immediately
+            fileHandle = INVALID_HANDLE; // Mark as closed
             
-            Print("Signal sent to hedge EA via file: ", signalType, " ", direction, " ", 
-                  DoubleToString(volume, 2), " lots");
+            if(writeResult > 0)
+            {
+               success = true;
+               Print("✅ Signal sent to hedge EA via file successfully!");
+               Print("   Signal: ", signalType, " ", direction, " ", DoubleToString(volume, 2), " lots");
+               Print("   Adjusted TP: ", DoubleToString(adjustedTP, 5), " SL: ", DoubleToString(adjustedSL, 5));
+               Print("   Bytes written: ", writeResult);
+            }
+            else
+            {
+               int writeError = GetLastError();
+               Print("❌ File write failed. Error: ", writeError, " (", GetErrorDescription(writeError), ")");
+            }
          }
          else
          {
             int errorCode = GetLastError();
-            Print("ERROR (attempt ", attempt, "): Failed to write signal file: ", errorCode);
+            Print("❌ File open attempt ", attempt, " failed. Error: ", errorCode, " (", GetErrorDescription(errorCode), ")");
+            Print("   Path: ", COMM_FILE_PATH);
             
-            // Wait briefly before retry
-            Sleep(100);
+            if(attempt < FILE_WRITE_RETRY)
+            {
+               Print("   Waiting 200ms before retry...");
+               Sleep(200); // Increased wait time
+               CleanupFileHandles(); // Clean up before retry
+            }
          }
       }
       
       if(!success)
       {
-         Print("CRITICAL ERROR: Failed to send signal to hedge EA after ", 
+         Print("💥 CRITICAL ERROR: Failed to send signal to hedge EA after ", 
                IntegerToString(FILE_WRITE_RETRY), " attempts!");
+         Print("   Signal data: ", signalData);
+         Print("   File path: ", COMM_FILE_PATH);
+         
+         // Try alternative method as last resort
+         TryAlternativeSignalMethod(signalData);
       }
    }
 }
+
+
 
 //+------------------------------------------------------------------+
 //| Send hedge bleed signal                                           |
