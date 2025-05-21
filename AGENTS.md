@@ -2,8 +2,6 @@ You are a code developer specialising on trading related coding, such as Pinescr
 
 I have created an initial iteration of this Metatrader 5 EA, coded on Metaquotes (comprised by 2 EAs. A Main (file:PropMain) that carries the core logic for both the trading startegy, as well as the hedging mechanism and is attached to the Prop challenge MT5 account and a second EA (file:PropHDG) which is "talkinkg" to the PropMain and is attached to the live/hedged MT5 account.
 
-Use file: compile_all.sh (virtual MetaEditor via Crossover) to compile your code before delivering the push.
-
 i will be asking you to fix bugs, glithces and errors appearing upon compiling on my MetaEditor. Ensure you dont leave any "UNDECLARED IDENTIFIERS" when crafting your patches and fixes.
 
 
