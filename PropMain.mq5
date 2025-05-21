@@ -1,376 +1,2143 @@
 //+------------------------------------------------------------------+
-//| Fixed bar confirmation function for true bar close               |
+//|                                       Synergy_Strategy_v1.02.mq5 |
+//|  Streamlined Synergy Strategy + PropEA‑style Hedge Engine (port) |
+//|                                                                  |
+//|  CHANGE LOG (v1.02 – 20‑May‑2025)                                |
+//|   • Added BARS_REQUIRED constant and warm‑up guard               |
+//|   • Robust history copying & buffer guards (no array overflow)   |
+//|   • Re‑implemented pivot‑scan functions with bounds checks       |
+//|   • Safe CopyBuffer calls with early return on incomplete data   |
+//|   • Hardened CalculateEMAValue & CalculateADXFilter              |
+//|   • Manual trades trigger hedge via OnTradeTransaction           |
 //+------------------------------------------------------------------+
+#property copyright "t2an1s"
+#property link      "http://www.yourwebsite.com"
+#property version   "1.02"
+#property strict
 
-// --- Placeholder global variables to allow successful compilation ---
-double   Open[], High[], Low[], Close[];
-datetime TimeSeries[];
-int      BARS_REQUIRED      = 100;
-bool     ShowPivotLines     = true;
-bool     ShowMarketBias     = true;
-double   synergyScore       = 0.0;
-bool     currentBiasPositive = false;
-bool     biasChangedToBullish = false;
-bool     biasChangedToBearish = false;
-bool     adxTrendCondition  = false;
-double   effectiveADXThreshold = 0.0;
-double   pivotStopLongEntry  = 0.0,
-         pivotTpLongEntry    = 0.0,
-         pivotStopShortEntry = 0.0,
-         pivotTpShortEntry   = 0.0;
+#include <Trade\Trade.mqh>
+#include <Arrays\ArrayObj.mqh>
+CTrade trade;
 
-// Forward declarations for helper functions used later in the file
-bool   IsNewBar();
-bool   IsInTradingSession();
-bool   HasOpenPosition();
-void   UpdateDashboard();
-void   DrawPivotLines();
-void   DrawDetectedPivotLines();
-void   ShowMarketBiasIndicator();
-void   ManageOpenPositions();
-void   OpenTrade(bool isBuy,double sl,double tp);
-void   TryAlternativeSignalMethod(string data);
-string GetErrorDescription(int code);
-double FindDeepestPivotLowBelowClose(int lookbackBars);
-double FindHighestPivotHighAboveClose(int lookbackBars);
-void   CalculateSynergyScore();
-void   CalculateMarketBias();
-void   CalculateADXFilter();
-void   CheckBleedCondition();
-bool IsConfirmedBar()
+//────────────────────────────────────────────────────────────────────
+// 1.  GLOBAL VARIABLES & CONSTANTS
+//────────────────────────────────────────────────────────────────────
+// ► min bars before activation (pivot window + safety)
+int  BARS_REQUIRED = 100;
+
+// ─── price & time buffers (user-side copies) ──────────────────────
+double   Open[] , High[] , Low[] , Close[];
+datetime TimeSeries[];            // ← renamed (was Time[])
+// Position‑management state
+// (unchanged lines omitted for brevity)
+double pivotStopLongEntry  = 0;
+double pivotTpLongEntry    = 0;
+double pivotStopShortEntry = 0;
+double pivotTpShortEntry   = 0;
+double lastEntryLots       = 0;
+double hedgeLotsLast       = 0;
+bool   scaleOut1LongTriggered = false;
+bool   scaleOut1ShortTriggered = false;
+bool   beAppliedLong = false;
+bool   beAppliedShort = false;
+bool   entryTriggersEnabled = true;
+bool   inSession            = true;
+// ── Hedge-link monitor ─────────────────────────────────────────────
+const int    HEARTBEAT_SEC    = 5;          // how often we publish our pulse
+const int    LINK_TIMEOUT_SEC = 15;         // grace window before status = NOT OK
+ulong        lastPulseSent    = 0;          // when we last pinged the other side
+bool         linkWasOK        = false;      // remembers previous state for debug prints
+string COMM_FILE_PATH = "MQL5\\Files\\MT5com.txt";
+string HEARTBEAT_FILE_PATH = "MQL5\\Files\\MT5com_heartbeat.txt";
+string HEDGE_HEARTBEAT_FILE_PATH = "MQL5\\Files\\MT5com_hedge_heartbeat.txt";
+const int FILE_WRITE_RETRY = 3;
+const int FILE_CHECK_SECONDS = 5;
+
+
+//--------------------------------------------------------------------
+// 2.  UTILITY — indicator buffer guard                               
+//--------------------------------------------------------------------
+inline bool CopyOk(int want, int got){ return got==want; }
+
+//+------------------------------------------------------------------+
+//| Enumeration for Communication Method                              |
+//+------------------------------------------------------------------+
+enum ENUM_COMMUNICATION_METHOD { 
+   GLOBAL_VARS,   // Global Variables
+   FILE_BASED     // File-Based
+};
+
+//+------------------------------------------------------------------+
+//| Input Parameters - General Settings                              |
+//+------------------------------------------------------------------+
+input group "General Settings"
+input string    EA_Name = "Synergy Strategy 2.0";   // EA Name
+input int       Magic_Number = 123456;                 // Magic Number
+input bool      EnableTrading = true;                  // Enable Trading
+input bool      TestingMode = false;                   // Strategy Tester Mode
+
+//+------------------------------------------------------------------+
+//| Input Parameters - Visualization Settings                         |
+//+------------------------------------------------------------------+
+input group "Visualization Settings"
+input bool      ShowPivotLines = true;                // Show Pivot Points on Chart
+input bool      ShowMarketBias = true;                // Show Market Bias Indicator
+
+//+------------------------------------------------------------------+
+//| Input Parameters - Risk Management                               |
+//+------------------------------------------------------------------+
+input group "Risk Management"
+input double    RiskPercent = 0.3;                     // Risk Percent per Trade
+input bool      UseFixedLot = false;                   // Use Fixed Lot Size
+input double    FixedLotSize = 0.01;                   // Fixed Lot Size
+input double    MinLot = 0.01;                         // Minimum Lot Size
+
+//+------------------------------------------------------------------+
+//| Input Parameters - PropEA Integration                             |
+//+------------------------------------------------------------------+
+input group "PropEA Settings"
+input double    ChallengeC = 700;                      // Challenge Fee
+input double    MaxDD = 4000;                          // Maximum Drawdown
+input double    StageTarget = 1000;                    // Stage Target
+input double    SlipBufD = 0.10;                       // Slippage Buffer
+input double    dailyDD = 1700;                        // Daily Drawdown Limit
+input int       HedgeEA_Magic = 789123;                // Hedge EA Magic Number
+input bool      InputEnableHedgeCommunication = true; // Enable Hedge Communication (read-only)
+bool EnableHedgeCommunication;  // Will be set in OnInit
+input ENUM_COMMUNICATION_METHOD CommunicationMethod = GLOBAL_VARS; // Hedge Communication Method
+
+// Shared signal file path (for FILE_BASED mode)
+string SignalFilePath;
+input int       CurrentPhase = 1;                      // Current Challenge Phase (1 or 2)
+
+//+------------------------------------------------------------------+
+//| Input Parameters - Scale-Out & BreakEven                          |
+//+------------------------------------------------------------------+
+input group "Scale-Out Settings"
+input bool      EnableScaleOut = true;                 // Enable Scale-Out Strategy
+input bool      ScaleOut1Enabled = true;               // Enable First Scale-Out
+input double    ScaleOut1Pct = 50;                     // Scale-Out at % of TP Distance
+input double    ScaleOut1Size = 50;                    // % of Position to Close
+input bool      ScaleOut1BE = true;                    // Set BE after Scale-Out
+
+input group "BreakEven Settings"
+input bool      EnableBreakEven = false;               // Enable BreakEven w/o Scale-Out
+input int       BeTriggerPips = 10;                    // BE Trigger (pips)
+
+//+------------------------------------------------------------------+
+//| Input Parameters - Pivot Point Settings                          |
+//+------------------------------------------------------------------+
+input group "Pivot Point Settings"
+input int       PivotTPBars = 50;                      // Lookback Bars for Pivot-based SL/TP
+input int       PivotLengthLeft = 6;                   // Pivot Length Left
+input int       PivotLengthRight = 6;                  // Pivot Length Right
+
+//+------------------------------------------------------------------+
+//| Input Parameters - Synergy Score Settings                         |
+//+------------------------------------------------------------------+
+input group "Synergy Score Settings"
+input bool      UseSynergyScore = true;                // Use Synergy Score
+input double    RSI_Weight = 1.0;                      // RSI Weight
+input double    Trend_Weight = 1.0;                    // MA Trend Weight
+input double    MACDV_Slope_Weight = 1.0;              // MACDV Slope Weight
+
+// Timeframe selection
+input bool      UseTF5min = true;                      // Use 5 Minute TF
+input double    Weight_M5 = 1.0;                       // 5min Weight
+input bool      UseTF15min = true;                     // Use 15 Minute TF
+input double    Weight_M15 = 1.0;                      // 15min Weight
+input bool      UseTF1hour = true;                     // Use 1 Hour TF
+input double    Weight_H1 = 1.0;                       // 1hour Weight
+
+//+------------------------------------------------------------------+
+//| Input Parameters - Market Bias Settings                           |
+//+------------------------------------------------------------------+
+input group "Market Bias Settings"
+input bool      UseMarketBias = true;                  // Use Market Bias
+input string    BiasTimeframe = "current";             // Market Bias Timeframe
+input int       HeikinAshiPeriod = 100;                // HA Period
+input int       OscillatorPeriod = 7;                  // Oscillator Period
+input color     BullishColor = clrLime;                // Bullish Color
+input color     BearishColor = clrRed;                 // Bearish Color
+
+//+------------------------------------------------------------------+
+//| Input Parameters - ADX Filter Settings                            |
+//+------------------------------------------------------------------+
+input group "ADX Filter Settings"
+input bool      EnableADXFilter = true;                // Enable ADX Filter
+input int       ADXPeriod = 14;                        // ADX Period
+input bool      UseDynamicADX = true;                  // Dynamic Threshold
+input double    StaticADXThreshold = 25;               // Static Threshold
+input int       ADXLookbackPeriod = 20;                // Average Lookback
+input double    ADXMultiplier = 0.8;                   // Multiplier
+input double    ADXMinThreshold = 15;                  // Minimum Threshold
+
+//+------------------------------------------------------------------+
+//| Input Parameters - Trading Sessions                               |
+//+------------------------------------------------------------------+
+input group "Trading Sessions"
+input bool      EnableSessionFilter = true;            // Enable Session Filter
+input string    MondaySession1 = "0000-2359";          // Monday Session 1
+input string    MondaySession2 = "";                   // Monday Session 2
+input string    TuesdaySession1 = "0000-2359";         // Tuesday Session 1
+input string    TuesdaySession2 = "";                  // Tuesday Session 2
+input string    WednesdaySession1 = "0000-2359";       // Wednesday Session 1
+input string    WednesdaySession2 = "";                // Wednesday Session 2
+input string    ThursdaySession1 = "0000-2359";        // Thursday Session 1
+input string    ThursdaySession2 = "";                 // Thursday Session 2
+input string    FridaySession1 = "0000-2359";          // Friday Session 1
+input string    FridaySession2 = "";                   // Friday Session 2
+input string    SaturdaySession1 = "0000-2359";        // Saturday Session 1
+input string    SaturdaySession2 = "";                 // Saturday Session 2
+input string    SundaySession1 = "0000-2359";          // Sunday Session 1
+input string    SundaySession2 = "";                   // Sunday Session 2
+
+//+------------------------------------------------------------------+
+//| Global Variables                                                  |
+//+------------------------------------------------------------------+
+double initialBalance;                                 // Starting balance
+double hedgeFactor;                                    // Hedge factor
+bool   bleedDone = false;                              // Hedge bleed flag
+
+// Indicator handles
+int rsiHandle_M5, maFastHandle_M5, maSlowHandle_M5, macdHandle_M5;
+int rsiHandle_M15, maFastHandle_M15, maSlowHandle_M15, macdHandle_M15;
+int rsiHandle_H1, maFastHandle_H1, maSlowHandle_H1, macdHandle_H1;
+
+// Indicator buffers
+double rsiBuffer_M5[], maFastBuffer_M5[], maSlowBuffer_M5[], macdBuffer_M5[], macdPrevBuffer_M5[];
+double rsiBuffer_M15[], maFastBuffer_M15[], maSlowBuffer_M15[], macdBuffer_M15[], macdPrevBuffer_M15[];
+double rsiBuffer_H1[], maFastBuffer_H1[], maSlowBuffer_H1[], macdBuffer_H1[], macdPrevBuffer_H1[];
+
+// Synergy score
+double synergyScore;
+
+// Market bias variables
+int haHandle;
+double haOpen[], haHigh[], haLow[], haClose[];
+double oscBias, oscSmooth;
+bool biasChangedToBullish = false;
+bool biasChangedToBearish = false;
+bool prevBiasPositive = false;
+bool currentBiasPositive = false;
+
+// ADX filter variables
+int adxHandle;
+double adxMain[], adxPlus[], adxMinus[];
+double effectiveADXThreshold;
+bool adxTrendCondition;
+
+// Prop EA sends “PROP_HB_{magic}”; hedge EA sends “HEDGE_HB_{magic}”
+//────────────────────────────────────────────────────────────────────
+// REPLACE THE SendHeartbeat FUNCTION
+//────────────────────────────────────────────────────────────────────
+void SendHeartbeat(bool isPropSide)
 {
-   static datetime lastBarTime = 0;
-   datetime currentBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+   if(!EnableHedgeCommunication) return;
    
-   // Check if we have enough history
-   if(ArraySize(TimeSeries) < 2)
-      return false;
-   
-   // Method 1: Check if we're in a new bar (just after previous bar closed)
-   if(lastBarTime != currentBarTime)
+   if(CommunicationMethod == GLOBAL_VARS)
    {
-      lastBarTime = currentBarTime;
-      // We're at the start of a new bar, so previous bar is confirmed closed
-      Print("DEBUG: New bar detected at ", TimeToString(currentBarTime), " - previous bar confirmed closed");
-      return true;
-   }
-   
-   // Method 2: Alternative - check if current bar is near close (last 10 seconds)
-   datetime nextBarTime = currentBarTime + PeriodSeconds();
-   int secondsUntilClose = (int)(nextBarTime - TimeCurrent());
-   
-   if(secondsUntilClose <= 10) // Last 10 seconds of current bar
-   {
-      static datetime lastNearCloseWarning = 0;
-      if(TimeCurrent() - lastNearCloseWarning > 30)
-      {
-         Print("DEBUG: Near bar close - ", secondsUntilClose, " seconds until next bar");
-         lastNearCloseWarning = TimeCurrent();
+      // Original global variable code
+      string name = "PROP_HB_" + IntegerToString(Magic_Number);
+      double currentTime = (double)TimeCurrent();
+      GlobalVariableSet(name, currentTime);
+      lastPulseSent = (ulong)TimeCurrent();
+      
+      // Periodically print debug info
+      static datetime lastPrintTime = 0;
+      if(TimeCurrent() - lastPrintTime > 60) {
+         Print("Main EA heartbeat sent: ", name, " = ", TimeToString((datetime)currentTime));
+         lastPrintTime = TimeCurrent();
       }
-      return true;
+   }
+   else // FILE_BASED
+   {
+      // Create heartbeat file with timestamp
+      int fileHandle = FileOpen(HEARTBEAT_FILE_PATH, FILE_WRITE|FILE_TXT|FILE_COMMON);
+      if(fileHandle != INVALID_HANDLE)
+      {
+         string heartbeatData = "MAIN_HEARTBEAT," + IntegerToString(Magic_Number) + "," + 
+                               IntegerToString(TimeCurrent());
+         FileWriteString(fileHandle, heartbeatData);
+         FileClose(fileHandle);
+         
+         // Report success with lower frequency to avoid log spam
+         static datetime lastReport = 0;
+         if(TimeCurrent() - lastReport > 60) {  // Report once per minute
+            Print("Main EA heartbeat sent to file: ", HEARTBEAT_FILE_PATH);
+            lastReport = TimeCurrent();
+         }
+      }
+      else
+      {
+         int error = GetLastError();
+         Print("ERROR: Failed to write heartbeat file: ", error);
+      }
+      
+      lastPulseSent = (ulong)TimeCurrent();
+   }
+}
+
+//────────────────────────────────────────────────────────────────────
+// REPLACE THE IsLinkAlive FUNCTION
+//────────────────────────────────────────────────────────────────────
+bool IsLinkAlive(bool isPropSide)
+{
+   if(!EnableHedgeCommunication) return false;
+   
+   if(CommunicationMethod == GLOBAL_VARS)
+   {
+      // Original global variable code
+      string peer = "HEDGE_HB_" + IntegerToString(HedgeEA_Magic);
+      
+      if(!GlobalVariableCheck(peer)) {
+         static datetime lastErrorTime = 0;
+         if(TimeCurrent() - lastErrorTime > 60) {
+            Print("ERROR: Hedge heartbeat not found: ", peer);
+            lastErrorTime = TimeCurrent();
+         }
+         return false;
+      }
+      
+      double ts = GlobalVariableGet(peer);
+      bool isAlive = (TimeCurrent() - (datetime)ts) <= LINK_TIMEOUT_SEC;
+      
+      // Log periodic status
+      static datetime lastStatusTime = 0;
+      if(TimeCurrent() - lastStatusTime > 60) {
+         Print("Hedge link status: ", isAlive ? "ALIVE" : "DEAD", 
+               " (Last beat: ", TimeToString((datetime)ts), 
+               ", Age: ", TimeCurrent() - (datetime)ts, "s)");
+         lastStatusTime = TimeCurrent();
+      }
+      
+      return isAlive;
+   }
+   else // FILE_BASED
+   {
+      // Try to read hedge heartbeat file - MUST USE FILE_COMMON FLAG
+      if(!FileIsExist(HEDGE_HEARTBEAT_FILE_PATH, FILE_COMMON))
+      {
+         static datetime lastErrorReport = 0;
+         if(TimeCurrent() - lastErrorReport > 30) {  // Report every 30 seconds
+            Print("WARNING: Hedge heartbeat file not found: ", HEDGE_HEARTBEAT_FILE_PATH);
+            lastErrorReport = TimeCurrent();
+         }
+         return false;
+      }
+      
+      int fileHandle = FileOpen(HEDGE_HEARTBEAT_FILE_PATH, FILE_READ|FILE_TXT|FILE_COMMON);
+      if(fileHandle == INVALID_HANDLE)
+      {
+         Print("ERROR: Unable to open hedge heartbeat file. Error: ", GetLastError());
+         return false;
+      }
+      
+      string content = FileReadString(fileHandle);
+      FileClose(fileHandle);
+      
+      // Parse heartbeat data: format is HEDGE_HEARTBEAT,magicnumber,timestamp
+      string parts[];
+      int count = StringSplit(content, ',', parts);
+      
+      // Check format validity (removed frequent debug message)
+      if(count < 3 || parts[0] != "HEDGE_HEARTBEAT")
+      {
+         static datetime lastFormatError = 0;
+         if(TimeCurrent() - lastFormatError > 60) {  // Only log format errors once per minute
+            Print("ERROR: Invalid hedge heartbeat format: ", content);
+            lastFormatError = TimeCurrent();
+         }
+         return false;
+      }
+      
+      // Check if magic number matches
+      if(parts[1] != IntegerToString(HedgeEA_Magic))
+      {
+         Print("ERROR: Hedge heartbeat has incorrect magic number: ", parts[1], 
+               " expected: ", HedgeEA_Magic);
+         return false;
+      }
+      
+      // Check timestamp - FIXED CALCULATION
+      string timestampString = parts[2];
+      if(StringLen(timestampString) > 0)
+      {
+         datetime heartbeatTime = (datetime)StringToInteger(timestampString);
+         
+         if(heartbeatTime > 0)
+         {
+            int ageSeconds = (int)(TimeCurrent() - heartbeatTime);  // Cast to int for proper display
+            bool isAlive = ageSeconds <= LINK_TIMEOUT_SEC;
+            
+            // Log status periodically
+            static bool wasAlive = false;
+            static datetime lastStatusLog = 0;
+            
+            if(isAlive != wasAlive || TimeCurrent() - lastStatusLog > 60)
+            {
+               Print("Hedge link status: ", isAlive ? "ALIVE" : "DEAD", 
+                     " (Last heartbeat: ", TimeToString(heartbeatTime), 
+                     ", Age: ", ageSeconds, "s)");
+               lastStatusLog = TimeCurrent();
+               wasAlive = isAlive;
+            }
+            
+            return isAlive;
+         }
+         else
+         {
+            Print("ERROR: Invalid timestamp value: ", timestampString, " parsed as ", heartbeatTime);
+            return false;
+         }
+      }
+      else
+      {
+         Print("ERROR: Empty timestamp string in heartbeat");
+         return false;
+      }
+   }
+}
+
+////+------------------------------------------------------------------+
+//| Expert initialization function                                    |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   // Set this at the very beginning of OnInit
+   EnableHedgeCommunication = InputEnableHedgeCommunication;
+
+   // Set trade parameters
+   trade.SetExpertMagicNumber(Magic_Number);
+
+   // Strategy Tester Mode
+   if(MQLInfoInteger(MQL_TESTER) || TestingMode)
+   {
+      // Disable hedge communication in tester
+      EnableHedgeCommunication = false;  
+      Print("Running in Strategy Tester Mode - Hedge communication disabled");
+   }
+
+   // Initialize file paths for cross-terminal communication
+   if(EnableHedgeCommunication && CommunicationMethod == FILE_BASED)
+   {
+      // Use RELATIVE paths with FILE_COMMON flag (this is what was working before)
+      HEARTBEAT_FILE_PATH = "MQL5\\Files\\MT5com_heartbeat.txt";
+      HEDGE_HEARTBEAT_FILE_PATH = "MQL5\\Files\\MT5com_hedge_heartbeat.txt";
+      COMM_FILE_PATH = "MQL5\\Files\\MT5com.txt";
+      SignalFilePath = "MQL5\\Files\\Synergy_Signals.txt";
+      
+      // Test file access for heartbeat with FILE_COMMON flag
+      int fileHandle = FileOpen(HEARTBEAT_FILE_PATH, FILE_WRITE|FILE_TXT|FILE_COMMON);
+      if(fileHandle != INVALID_HANDLE)
+      {
+         FileWriteString(fileHandle, "MAIN_HEARTBEAT," + IntegerToString(Magic_Number) + "," + 
+                        IntegerToString(TimeCurrent()));
+         FileClose(fileHandle);
+         Print("File-based communication initialized. Magic: ", Magic_Number);
+         Print("Heartbeat file created: ", HEARTBEAT_FILE_PATH);
+      }
+      else
+      {
+         int errorCode = GetLastError();
+         Print("ERROR: Failed to create heartbeat file: ", errorCode);
+         Print("Path: ", HEARTBEAT_FILE_PATH);
+         Print("Will continue initialization - communication may be limited");
+         // Don't fail initialization - continue anyway
+      }
    }
    
-   return false;
+   // Store initial balance
+   initialBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   
+   // Calculate hedge factor
+   hedgeFactor = MathMin(1.0, (ChallengeC * (1.0 + SlipBufD)) / MaxDD);
+   
+   // Initialize Session Filters
+   if(!InitTradingSessions())
+   {
+      Print("Failed to initialize trading sessions");
+      return(INIT_FAILED);
+   }
+   
+   // Initialize all indicators and systems
+   if(!InitSynergyIndicators())
+   {
+      Print("Failed to initialize Synergy Score indicators");
+      return(INIT_FAILED);
+   }
+   
+   if(!InitMarketBias())
+   {
+      Print("Failed to initialize Market Bias indicator");
+      return(INIT_FAILED);
+   }
+   
+   if(!InitADXFilter())
+   {
+      Print("Failed to initialize ADX Filter");
+      return(INIT_FAILED);
+   }
+   
+   // Set up arrays for price data
+   ArraySetAsSeries(Open, true);
+   ArraySetAsSeries(High, true);
+   ArraySetAsSeries(Low, true);
+   ArraySetAsSeries(Close, true);
+   ArraySetAsSeries(TimeSeries, true);
+
+   // Compute dynamic history requirement
+   BARS_REQUIRED = MathMax(PivotTPBars + PivotLengthLeft + PivotLengthRight + 5, 100);
+   Print("History warm-up requirement set to ",BARS_REQUIRED," bars");   
+   
+   // Create dashboard 
+   CreateDashboard();
+   
+   // Initialize scale-out tracking variables
+   scaleOut1LongTriggered = false;
+   scaleOut1ShortTriggered = false;
+   beAppliedLong = false;
+   beAppliedShort = false;
+   
+   // Enable all triggers
+   entryTriggersEnabled = UseSynergyScore || UseMarketBias;
+
+   // Set up hedge communication if enabled
+   if(EnableHedgeCommunication)
+   {
+      if(CommunicationMethod == GLOBAL_VARS)
+      {
+         // Initialize the global variables for the hedge EA to find
+         GlobalVariableSet("PROP_HB_" + IntegerToString(Magic_Number), (double)TimeCurrent());
+         GlobalVariableSet("EASignal_Connected_"+IntegerToString(HedgeEA_Magic), (double)TimeCurrent());
+         Print("Hedge communication enabled (Global Variables). Target EA Magic: ", HedgeEA_Magic);
+         Print("Main EA registered heartbeat with Magic: ", Magic_Number);
+         Print("Main EA looking for hedge with Magic: ", HedgeEA_Magic);
+         
+         // Add diagnostic output of all global variables
+         Print("--- GLOBAL VARIABLES AT INIT ---");
+         for(int i=0; i<GlobalVariablesTotal(); i++) {
+            string name = GlobalVariableName(i);
+            double value = GlobalVariableGet(name);
+            Print(name, " = ", value);
+         }
+         Print("-------------------------------");
+      }
+      else // FILE_BASED
+      {
+         Print("File-based communication paths:");
+         Print("- Main heartbeat: ", HEARTBEAT_FILE_PATH);
+         Print("- Hedge heartbeat: ", HEDGE_HEARTBEAT_FILE_PATH);
+         Print("- Signal file: ", COMM_FILE_PATH);
+         Print("Hedge communication enabled (File-Based). Target EA Magic: ", HedgeEA_Magic);
+      }
+   }
+
+   // Start heartbeat system
+   EventSetTimer(HEARTBEAT_SEC);
+   SendHeartbeat(true);
+   linkWasOK = IsLinkAlive(true);
+
+   // Print initial settings for verification
+   Print("SETTINGS VERIFICATION:");
+   Print("UseFixedLot = ", UseFixedLot ? "TRUE" : "FALSE");
+   Print("FixedLotSize = ", FixedLotSize);
+   Print("RiskPercent = ", RiskPercent);
+   Print("MinLot = ", MinLot);
+   Print("Magic_Number = ", Magic_Number);
+   Print("HedgeEA_Magic = ", HedgeEA_Magic);
+   Print("EnableHedgeCommunication = ", EnableHedgeCommunication ? "TRUE" : "FALSE");
+   Print("CommunicationMethod = ", CommunicationMethod == GLOBAL_VARS ? "GLOBAL_VARS" : "FILE_BASED");
+   Print("Synergy Strategy v1.02 initialised. Hedge factor:",DoubleToString(hedgeFactor,4));
+
+   return(INIT_SUCCEEDED);
 }
 
 //+------------------------------------------------------------------+
-//| Enhanced OnTick with strict bar close requirement                |
+//| Expert tick function (hardened v1.02)                            |
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   // === DEBUGGING SECTION START ===
-   static int debugCounter = 0;
-   static datetime lastDebugTime = 0;
-   debugCounter++;
-   
-   // Print basic status every 50 ticks or every 30 seconds
-   if(debugCounter % 50 == 0 || TimeCurrent() - lastDebugTime > 30) {
-      Print("=== BASIC STATUS CHECK #", debugCounter, " ===");
-      Print("Time: ", TimeToString(TimeCurrent()));
-      Print("EnableTrading: ", EnableTrading);
-      Print("IsMarketOpen: ", IsMarketOpen());
-      Print("Bars Available: ", Bars(_Symbol,PERIOD_CURRENT), " / Required: ", BARS_REQUIRED);
-      Print("Has Open Position: ", HasOpenPosition());
-      lastDebugTime = TimeCurrent();
-   }
-   
-   // 0) global guards with detailed logging
-   if(!EnableTrading) {
-      if(debugCounter % 100 == 0) Print("DEBUG: Trading disabled");
-      return;
-   }
-   if(!IsMarketOpen()) {
-      if(debugCounter % 100 == 0) Print("DEBUG: Market closed");
-      return;
-   }
-   if(Bars(_Symbol,PERIOD_CURRENT)<BARS_REQUIRED) {
-      if(debugCounter % 100 == 0) Print("DEBUG: Insufficient bars - Available: ", Bars(_Symbol,PERIOD_CURRENT), " Required: ", BARS_REQUIRED);
-      return;
-   }
+   // 0) global guards
+   if(!EnableTrading)                      return;          // trading toggle
+   if(!IsMarketOpen())                     return;          // symbol halted
+   if(Bars(_Symbol,PERIOD_CURRENT)<BARS_REQUIRED) return;   // history warm-up
 
    // 1) update dashboard & visuals every tick
    UpdateDashboard();
    if(ShowPivotLines)  DrawPivotLines();
    if(ShowMarketBias)  ShowMarketBiasIndicator();
 
-   // 2) CHECK FOR NEW BAR - CRITICAL FOR BAR CLOSE TRADING
+   // 2) only run heavy logic once per bar
    if(!IsNewBar()) return;
-   
-   // 3) WAIT FOR BAR CONFIRMATION - ONLY TRADE ON BAR CLOSE
-   if(!IsConfirmedBar())
-   {
-      static datetime lastBarWait = 0;
-      if(TimeCurrent() - lastBarWait > 30)
-      {
-         Print("DEBUG: Waiting for bar close confirmation...");
-         lastBarWait = TimeCurrent();
-      }
-      return;
-   }
 
-   Print("====================================================");
-   Print("=== BAR CLOSE ANALYSIS - ", TimeToString(TimeCurrent()), " ===");
-   Print("====================================================");
-   
-   // 4) pull fresh history with detailed logging
+   // 3) pull fresh history – sized exactly to what the pivots need
    int needBars = MathMax(PivotTPBars + PivotLengthLeft + PivotLengthRight + 5 , 100);
-   Print("DEBUG: Need ", needBars, " bars for analysis");
-   
-   if(CopyClose(_Symbol,PERIOD_CURRENT,0,needBars,Close) < needBars) {
-      Print("ERROR: Failed to copy Close prices - got ", ArraySize(Close), " need ", needBars);
-      return;
-   }
-   if(CopyOpen(_Symbol,PERIOD_CURRENT,0,needBars,Open) < needBars) {
-      Print("ERROR: Failed to copy Open prices");
-      return;
-   }
-   if(CopyHigh(_Symbol,PERIOD_CURRENT,0,needBars,High) < needBars) {
-      Print("ERROR: Failed to copy High prices");
-      return;
-   }
-   if(CopyLow(_Symbol,PERIOD_CURRENT,0,needBars,Low) < needBars) {
-      Print("ERROR: Failed to copy Low prices");
-      return;
-   }
-   if(CopyTime(_Symbol,PERIOD_CURRENT,0,needBars,TimeSeries) < needBars) {
-      Print("ERROR: Failed to copy Time series");
-      return;
-   }
-   Print("DEBUG: Successfully copied price data - Arrays size: ", ArraySize(Close));
+   if(CopyClose(_Symbol,PERIOD_CURRENT,0,needBars,Close)        < needBars) return;
+   if(CopyOpen (_Symbol,PERIOD_CURRENT,0,needBars,Open )        < needBars) return;
+   if(CopyHigh (_Symbol,PERIOD_CURRENT,0,needBars,High )        < needBars) return;
+   if(CopyLow  (_Symbol,PERIOD_CURRENT,0,needBars,Low  )        < needBars) return;
+   if(CopyTime (_Symbol,PERIOD_CURRENT,0,needBars,TimeSeries)   < needBars) return;
 
-   // 5) session filter with logging
-   bool sessionAllowed = IsInTradingSession();
-   Print("DEBUG: Trading Session Check: ", sessionAllowed ? "IN SESSION" : "OUT OF SESSION");
-   if(!sessionAllowed) {
-      Print("DEBUG: Outside trading session - exiting");
-      return;
-   }
+   // 4) session filter
+   if(!IsInTradingSession())
+      { Print("Outside session");  return; }
 
-   // 6) refresh indicators ONLY ON BAR CLOSE
-   Print("--- INDICATOR CALCULATIONS (BAR CLOSE) ---");
-   double oldSynergyScore = synergyScore;
-   bool oldBiasPositive = currentBiasPositive;
-   bool oldBiasChangedToBullish = biasChangedToBullish;
-   bool oldBiasChangedToBearish = biasChangedToBearish;
-   bool oldAdxCondition = adxTrendCondition;
-   
+   // 5) refresh indicators
    CalculateSynergyScore();
    CalculateMarketBias();
    CalculateADXFilter();
-   
-   Print("SYNERGY SCORE: ", DoubleToString(synergyScore, 3), " (was: ", DoubleToString(oldSynergyScore, 3), ") - Enabled: ", UseSynergyScore);
-   Print("MARKET BIAS: Current=", currentBiasPositive ? "BULLISH" : "BEARISH", " (was: ", oldBiasPositive ? "BULLISH" : "BEARISH", ") - Enabled: ", UseMarketBias);
-   Print("BIAS CHANGES: ToBullish=", biasChangedToBullish, " (was: ", oldBiasChangedToBullish, "), ToBearish=", biasChangedToBearish, " (was: ", oldBiasChangedToBearish, ")");
-   Print("ADX TREND: ", adxTrendCondition ? "TRUE" : "FALSE", " (was: ", oldAdxCondition ? "TRUE" : "FALSE", ") - Enabled: ", EnableADXFilter);
-   if(EnableADXFilter) Print("ADX Threshold: ", DoubleToString(effectiveADXThreshold, 2));
 
-   // 7) derive swing-pivots with detailed logging and selection criteria
-   Print("--- PIVOT CALCULATION ---");
-   Print("Pivot Selection Criteria:");
-   Print("  LONG SL  = DEEPEST pivot low BELOW current price (within ", PivotTPBars, " bars)");
-   Print("  LONG TP  = HIGHEST pivot high ABOVE current price (within ", PivotTPBars, " bars)");
-   Print("  SHORT SL = HIGHEST pivot high ABOVE current price (within ", PivotTPBars, " bars)");
-   Print("  SHORT TP = DEEPEST pivot low BELOW current price (within ", PivotTPBars, " bars)");
-   
-   double slLong  = FindDeepestPivotLowBelowClose(PivotTPBars);   // Deepest (lowest) pivot low below price
-   double tpLong  = FindHighestPivotHighAboveClose(PivotTPBars);  // Highest pivot high above price
-   double slShort = FindHighestPivotHighAboveClose(PivotTPBars);  // Highest pivot high above price  
-   double tpShort = FindDeepestPivotLowBelowClose(PivotTPBars);   // Deepest (lowest) pivot low below price
-
-   Print("Current Price: ", DoubleToString(Close[0], 5));
-   Print("SELECTED PIVOTS:");
-   Print("  LONG  - SL: ", DoubleToString(slLong, 5), " (DEEPEST low below, valid: ", (slLong > 0 && slLong < Close[0]) ? "YES" : "NO", ")");
-   Print("  LONG  - TP: ", DoubleToString(tpLong, 5), " (HIGHEST high above, valid: ", (tpLong > 0 && tpLong > Close[0]) ? "YES" : "NO", ")");
-   Print("  SHORT - SL: ", DoubleToString(slShort, 5), " (HIGHEST high above, valid: ", (slShort > 0 && slShort > Close[0]) ? "YES" : "NO", ")");
-   Print("  SHORT - TP: ", DoubleToString(tpShort, 5), " (DEEPEST low below, valid: ", (tpShort > 0 && tpShort < Close[0]) ? "YES" : "NO", ")");
-
-   // NO FALLBACK - Strategy requires valid pivot points only
-   bool hasValidLongPivots = (slLong > 0 && slLong < Close[0] && tpLong > 0 && tpLong > Close[0]);
-   bool hasValidShortPivots = (slShort > 0 && slShort > Close[0] && tpShort > 0 && tpShort < Close[0]);
-   
-   if(!hasValidLongPivots && !hasValidShortPivots)
-   {
-      Print("DEBUG: No valid pivot combinations found - NO TRADE (Strategy requires strict pivot SL/TP)");
-   }
-   else if(!hasValidLongPivots)
-   {
-      Print("DEBUG: No valid LONG pivot combination (SL:", DoubleToString(slLong,5), " TP:", DoubleToString(tpLong,5), ")");
-   }
-   else if(!hasValidShortPivots)
-   {
-      Print("DEBUG: No valid SHORT pivot combination (SL:", DoubleToString(slShort,5), " TP:", DoubleToString(tpShort,5), ")");
-   }
-
-   // Draw pivot lines on chart
-   DrawDetectedPivotLines();
+   // 6) derive swing-pivots
+   double slLong  = FindDeepestPivotLowBelowClose (PivotTPBars);
+   double tpLong  = FindHighestPivotHighAboveClose(PivotTPBars);
+   double slShort = FindHighestPivotHighAboveClose(PivotTPBars);
+   double tpShort = FindDeepestPivotLowBelowClose (PivotTPBars);
 
    if(slLong  >0) pivotStopLongEntry  = slLong;
    if(tpLong  >0) pivotTpLongEntry    = tpLong;
    if(slShort >0) pivotStopShortEntry = slShort;
    if(tpShort >0) pivotTpShortEntry   = tpShort;
 
-   // 8) build entry conditions with detailed breakdown
-   Print("--- ENTRY CONDITIONS ANALYSIS ---");
-   
-   // Common conditions
-   bool confirmedBar = true; // We already checked this above
-   bool hasPosition = HasOpenPosition();
-   bool inSessionCheck2 = IsInTradingSession(); // Double check
-   
-   Print("COMMON CONDITIONS:");
-   Print("  ✓ Bar Close Confirmed: TRUE");
-   Print("  ✓ Entry Triggers Enabled: ", entryTriggersEnabled ? "TRUE" : "FALSE");
-   Print("  ✓ ADX Trend Condition: ", adxTrendCondition ? "TRUE" : "FALSE");
-   Print("  ✓ In Trading Session: ", inSessionCheck2 ? "TRUE" : "FALSE");
-   Print("  ✓ No Open Position: ", !hasPosition ? "TRUE" : "FALSE");
-   
-   // Long conditions breakdown
-   bool longSynergyOK = UseSynergyScore ? synergyScore>0 : true;
-   bool longBiasOK = UseMarketBias ? biasChangedToBullish : true; // Keep original logic as requested
-   bool longPivotSLOK = slLong > 0 && slLong < Close[0];
-   bool longPivotTPOK = tpLong > 0 && tpLong > Close[0];
-   
-   Print("LONG CONDITIONS:");
-   Print("  ✓ Synergy OK: ", longSynergyOK ? "TRUE" : "FALSE", " (Score: ", DoubleToString(synergyScore, 3), ", Required: >0, Enabled: ", UseSynergyScore, ")");
-   Print("  ✓ Bias OK: ", longBiasOK ? "TRUE" : "FALSE", " (ChangedToBullish: ", biasChangedToBullish, ", Enabled: ", UseMarketBias, ")");
-   Print("  ✓ Pivot SL OK: ", longPivotSLOK ? "TRUE" : "FALSE", " (", DoubleToString(slLong, 5), " < ", DoubleToString(Close[0], 5), ")");
-   Print("  ✓ Pivot TP OK: ", longPivotTPOK ? "TRUE" : "FALSE", " (", DoubleToString(tpLong, 5), " > ", DoubleToString(Close[0], 5), ")");
+   // 7) build entry conditions
+   bool longCond =
+       IsConfirmedBar() &&
+       entryTriggersEnabled          &&
+       adxTrendCondition             &&
+       (UseSynergyScore ? synergyScore>0 : true) &&
+       (UseMarketBias  ? biasChangedToBullish : true) &&
+       slLong  >0 && slLong  < Close[0] &&
+       tpLong  >0 && tpLong  > Close[0] &&
+       IsInTradingSession();
 
-   bool longCond = confirmedBar && entryTriggersEnabled && adxTrendCondition && 
-                   longSynergyOK && longBiasOK && longPivotSLOK && longPivotTPOK && 
-                   inSessionCheck2 && !hasPosition;
-   
-   // Short conditions breakdown
-   bool shortSynergyOK = UseSynergyScore ? synergyScore<0 : true;
-   bool shortBiasOK = UseMarketBias ? biasChangedToBearish : true; // Keep original logic as requested
-   bool shortPivotSLOK = slShort > 0 && slShort > Close[0];
-   bool shortPivotTPOK = tpShort > 0 && tpShort < Close[0];
-   
-   Print("SHORT CONDITIONS:");
-   Print("  ✓ Synergy OK: ", shortSynergyOK ? "TRUE" : "FALSE", " (Score: ", DoubleToString(synergyScore, 3), ", Required: <0, Enabled: ", UseSynergyScore, ")");
-   Print("  ✓ Bias OK: ", shortBiasOK ? "TRUE" : "FALSE", " (ChangedToBearish: ", biasChangedToBearish, ", Enabled: ", UseMarketBias, ")");
-   Print("  ✓ Pivot SL OK: ", shortPivotSLOK ? "TRUE" : "FALSE", " (", DoubleToString(slShort, 5), " > ", DoubleToString(Close[0], 5), ")");
-   Print("  ✓ Pivot TP OK: ", shortPivotTPOK ? "TRUE" : "FALSE", " (", DoubleToString(tpShort, 5), " < ", DoubleToString(Close[0], 5), ")");
+   bool shortCond =
+       IsConfirmedBar() &&
+       entryTriggersEnabled          &&
+       adxTrendCondition             &&
+       (UseSynergyScore ? synergyScore<0 : true) &&
+       (UseMarketBias  ? biasChangedToBearish : true) &&
+       slShort >0 && slShort > Close[0] &&
+       tpShort >0 && tpShort < Close[0] &&
+       IsInTradingSession();
 
-   bool shortCond = confirmedBar && entryTriggersEnabled && adxTrendCondition && 
-                    shortSynergyOK && shortBiasOK && shortPivotSLOK && shortPivotTPOK && 
-                    inSessionCheck2 && !hasPosition;
+   // 8) execute
+   if(longCond  && !HasOpenPosition()) OpenTrade(true , slLong , tpLong );
+   if(shortCond && !HasOpenPosition()) OpenTrade(false, slShort, tpShort);
 
-   Print("--- FINAL RESULTS ---");
-   Print("LONG CONDITION RESULT: ", longCond ? "✓ TRUE - TRADE SIGNAL!" : "✗ FALSE");
-   Print("SHORT CONDITION RESULT: ", shortCond ? "✓ TRUE - TRADE SIGNAL!" : "✗ FALSE");
-   
-   if(!longCond && !shortCond) {
-      Print("❌ NO TRADE SIGNALS - Check failed conditions above");
-      
-      // Identify the most likely blockers
-      if(!entryTriggersEnabled) Print("🚫 BLOCKER: Entry triggers disabled");
-      if(!adxTrendCondition && EnableADXFilter) Print("🚫 BLOCKER: ADX condition failed");
-      if(hasPosition) Print("🚫 BLOCKER: Position already open");
-      if(!inSessionCheck2) Print("🚫 BLOCKER: Outside trading session");
-      if(UseMarketBias && !biasChangedToBullish && !biasChangedToBearish) Print("🚫 BLOCKER: Market bias not changing (waiting for bias shift)");
-      if(!hasValidLongPivots && !hasValidShortPivots) Print("🚫 BLOCKER: No valid pivot SL/TP combinations found (strict pivot strategy)");
-   }
-
-   // 9) execute with enhanced logging - ONLY ON BAR CLOSE
-   if(longCond && !HasOpenPosition()) {
-      Print("🚀 EXECUTING LONG TRADE ON BAR CLOSE!");
-      Print("   Entry Price: ~", DoubleToString(Close[0], 5));
-      Print("   Stop Loss: ", DoubleToString(slLong, 5));
-      Print("   Take Profit: ", DoubleToString(tpLong, 5));
-      Print("   Using Fallback Levels: NO - Strict pivot strategy");
-      OpenTrade(true, slLong, tpLong);
-   }
-   if(shortCond && !HasOpenPosition()) {
-      Print("🚀 EXECUTING SHORT TRADE ON BAR CLOSE!");
-      Print("   Entry Price: ~", DoubleToString(Close[0], 5));
-      Print("   Stop Loss: ", DoubleToString(slShort, 5));
-      Print("   Take Profit: ", DoubleToString(tpShort, 5));
-      Print("   Using Fallback Levels: NO - Strict pivot strategy");
-      OpenTrade(false, slShort, tpShort);
-   }
-
-   // 10) manage & bleed
+   // 9) manage & bleed
    ManageOpenPositions();
    CheckBleedCondition();
-   
-   Print("====================================================");
 }
 
 //+------------------------------------------------------------------+
-//| Fixed SendHedgeSignal with correct SL/TP for hedge direction     |
+//| Expert deinitialization function                                 |
 //+------------------------------------------------------------------+
-void SendHedgeSignal(string signalType, string direction, double volume, double tp, double sl)
+void OnDeinit(const int reason)
 {
-   if(!EnableHedgeCommunication) 
+   // Release indicators
+   ReleaseSynergyIndicators();
+   ReleaseMarketBias();
+   ReleaseADXFilter();
+   
+   // Delete dashboard and other objects
+   DeleteDashboard();
+   EventKillTimer();
+   
+   // Clean up visual elements
+   if(ShowPivotLines) ObjectsDeleteAll(0, "PivotLine_");
+   if(ShowMarketBias) ObjectsDeleteAll(0, "MarketBias_");
+   
+   // Clean up communication global variables
+   if(EnableHedgeCommunication && CommunicationMethod == GLOBAL_VARS)
    {
-      Print("DEBUG: SendHedgeSignal called but communication disabled");
+      GlobalVariableDel("EASignal_Connected_"+IntegerToString(HedgeEA_Magic));
+      GlobalVariableDel("EASignal_Type_"+IntegerToString(HedgeEA_Magic));
+      GlobalVariableDel("EASignal_Direction_"+IntegerToString(HedgeEA_Magic));
+      GlobalVariableDel("EASignal_Volume_"+IntegerToString(HedgeEA_Magic));
+      GlobalVariableDel("EASignal_SL_"+IntegerToString(HedgeEA_Magic));
+   GlobalVariableDel("EASignal_TP_"+IntegerToString(HedgeEA_Magic));
+   GlobalVariableDel("EASignal_Time_"+IntegerToString(HedgeEA_Magic));
+  }
+
+   // Remove temporary files when using file communication
+   if(EnableHedgeCommunication && CommunicationMethod == FILE_BASED)
+   {
+      string commonPath   = TerminalInfoString(TERMINAL_COMMONDATA_PATH) + "\\MQL5\\Files";
+      string heartbeatFile = commonPath + "\\MT5com_heartbeat.txt";
+      string signalFile    = commonPath + "\\MT5com.txt";
+
+      int fh = FileOpen(heartbeatFile, FILE_READ|FILE_TXT);
+      if(fh != INVALID_HANDLE)
+      {
+         FileClose(fh);
+         if(FileDelete(heartbeatFile))
+            Print("Deleted heartbeat file: ", heartbeatFile);
+      }
+
+      fh = FileOpen(signalFile, FILE_READ|FILE_TXT);
+      if(fh != INVALID_HANDLE)
+      {
+         FileClose(fh);
+         if(FileDelete(signalFile))
+            Print("Deleted signal file: ", signalFile);
+      }
+   }
+   
+   Print("Synergy Strategy stopped. Reason: ", GetUninitReasonText(reason));
+}
+
+//+------------------------------------------------------------------+
+//| Trade transaction handler - reacts to manual trades               |
+//+------------------------------------------------------------------+
+void OnTradeTransaction(const MqlTradeTransaction &trans,
+                        const MqlTradeRequest    &request,
+                        const MqlTradeResult     &result)
+{
+   if(!EnableHedgeCommunication)              return;
+   if(trans.type!=TRADE_TRANSACTION_DEAL_ADD) return;
+   if(trans.symbol!=_Symbol)                  return;
+
+   // Pull deal info from history for reliability
+   if(!HistoryDealSelect(trans.deal))
+      return; // no info available
+
+   long          magic = (long)HistoryDealGetInteger(trans.deal, DEAL_MAGIC);
+   ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+
+   // Ignore EA managed positions
+   if(magic==Magic_Number) return;
+
+   if(entry==DEAL_ENTRY_IN)
+   {
+      bool isLong = (trans.deal_type==DEAL_TYPE_BUY);
+
+      lastEntryLots  = trans.volume;
+      hedgeLotsLast  = NormalizeLots(lastEntryLots*hedgeFactor);
+
+      SendHedgeSignal("OPEN", isLong?"SELL":"BUY", hedgeLotsLast,
+                      trans.price_tp, trans.price_sl);
+   }
+   else if(entry==DEAL_ENTRY_OUT)
+   {
+      bool closingLong  = (trans.deal_type==DEAL_TYPE_SELL);
+      double vol        = NormalizeLots(trans.volume*hedgeFactor);
+
+      SendHedgeSignal("PARTIAL_CLOSE", closingLong?"SELL":"BUY", vol, 0, 0);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Pulse & link-status checker                                      |
+//+------------------------------------------------------------------+
+void OnTimer()
+{
+   // 1) send our heartbeat every HEARTBEAT_SEC
+   SendHeartbeat(true);   // hedge EA uses false
+
+   // 2) evaluate link
+   bool ok = IsLinkAlive(true);
+   if(ok != linkWasOK)              // state changed → print once
+   {
+      Print("Hedge link is now ", ok ? "OK ✅" : "NOT OK ❌");
+      
+      // When link fails, print global variables for diagnostic
+      if(!ok) {
+         Print("--- GLOBAL VARIABLES WHEN LINK FAILED ---");
+         for(int i=0; i<GlobalVariablesTotal(); i++) {
+            string name = GlobalVariableName(i);
+            double value = GlobalVariableGet(name);
+            Print(name, " = ", value);
+         }
+         Print("-------------------------------");
+      }
+      
+      linkWasOK = ok;
+   }
+}
+
+
+//+------------------------------------------------------------------+
+//| Draw Pivot Lines on Chart                                        |
+//+------------------------------------------------------------------+
+void DrawPivotLines()
+{
+   // Delete existing lines first
+   ObjectsDeleteAll(0, "PivotLine_");
+   
+   if(!ShowPivotLines) return;
+   
+   // Get current pivot levels
+   double stopLossLong = FindDeepestPivotLowBelowClose(PivotTPBars);
+   double takeProfitLong = FindHighestPivotHighAboveClose(PivotTPBars);
+   double stopLossShort = FindHighestPivotHighAboveClose(PivotTPBars);
+   double takeProfitShort = FindDeepestPivotLowBelowClose(PivotTPBars);
+   
+   // Draw Stop Loss Long
+   if(stopLossLong > 0) {
+      ObjectCreate(0, "PivotLine_SL_Long", OBJ_HLINE, 0, 0, stopLossLong);
+      ObjectSetInteger(0, "PivotLine_SL_Long", OBJPROP_COLOR, clrRed);
+      ObjectSetInteger(0, "PivotLine_SL_Long", OBJPROP_STYLE, STYLE_DASH);
+      ObjectSetInteger(0, "PivotLine_SL_Long", OBJPROP_WIDTH, 1);
+      ObjectSetString(0, "PivotLine_SL_Long", OBJPROP_TEXT, "SL Long");
+   }
+   
+   // Draw Take Profit Long
+   if(takeProfitLong > 0) {
+      ObjectCreate(0, "PivotLine_TP_Long", OBJ_HLINE, 0, 0, takeProfitLong);
+      ObjectSetInteger(0, "PivotLine_TP_Long", OBJPROP_COLOR, clrGreen);
+      ObjectSetInteger(0, "PivotLine_TP_Long", OBJPROP_STYLE, STYLE_DASH);
+      ObjectSetInteger(0, "PivotLine_TP_Long", OBJPROP_WIDTH, 1);
+      ObjectSetString(0, "PivotLine_TP_Long", OBJPROP_TEXT, "TP Long");
+   }
+   
+   // Draw Stop Loss Short
+   if(stopLossShort > 0) {
+      ObjectCreate(0, "PivotLine_SL_Short", OBJ_HLINE, 0, 0, stopLossShort);
+      ObjectSetInteger(0, "PivotLine_SL_Short", OBJPROP_COLOR, clrRed);
+      ObjectSetInteger(0, "PivotLine_SL_Short", OBJPROP_STYLE, STYLE_DOT);
+      ObjectSetInteger(0, "PivotLine_SL_Short", OBJPROP_WIDTH, 1);
+      ObjectSetString(0, "PivotLine_SL_Short", OBJPROP_TEXT, "SL Short");
+   }
+   
+   // Draw Take Profit Short
+   if(takeProfitShort > 0) {
+      ObjectCreate(0, "PivotLine_TP_Short", OBJ_HLINE, 0, 0, takeProfitShort);
+      ObjectSetInteger(0, "PivotLine_TP_Short", OBJPROP_COLOR, clrGreen);
+      ObjectSetInteger(0, "PivotLine_TP_Short", OBJPROP_STYLE, STYLE_DOT);
+      ObjectSetInteger(0, "PivotLine_TP_Short", OBJPROP_WIDTH, 1);
+      ObjectSetString(0, "PivotLine_TP_Short", OBJPROP_TEXT, "TP Short");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Show Market Bias Indicator                                       |
+//+------------------------------------------------------------------+
+void ShowMarketBiasIndicator()
+{
+   // Delete existing indicator first
+   ObjectsDeleteAll(0, "MarketBias_");
+   
+   if(!ShowMarketBias) return;
+   
+   // Create market bias indicator
+   string name = "MarketBias_Indicator";
+   
+   // Create the dot
+   ObjectCreate(0, name, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, 10);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, 80);
+   ObjectSetInteger(0, name, OBJPROP_XSIZE, 20);
+   ObjectSetInteger(0, name, OBJPROP_YSIZE, 20);
+   ObjectSetInteger(0, name, OBJPROP_BGCOLOR, currentBiasPositive ? BullishColor : BearishColor);
+   ObjectSetInteger(0, name, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_RIGHT_UPPER);
+   
+   // Add label
+   ObjectCreate(0, name+"_Label", OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, name+"_Label", OBJPROP_XDISTANCE, 40);
+   ObjectSetInteger(0, name+"_Label", OBJPROP_YDISTANCE, 85);
+   ObjectSetString(0, name+"_Label", OBJPROP_TEXT, "Bias");
+   ObjectSetInteger(0, name+"_Label", OBJPROP_COLOR, clrWhite);
+   ObjectSetInteger(0, name+"_Label", OBJPROP_CORNER, CORNER_RIGHT_UPPER);
+}
+
+//+------------------------------------------------------------------+
+//| Session Management Functions                                      |
+//+------------------------------------------------------------------+
+bool InitTradingSessions()
+{
+   if(!EnableSessionFilter)
+   {
+      inSession = true;
+      return true;
+   }
+   
+   // Nothing special to initialize for sessions, just return success
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Check if we're in trading session                                |
+//+------------------------------------------------------------------+
+bool IsInTradingSession()
+{
+   if(!EnableSessionFilter) return true;
+   
+   // Get current time
+   datetime serverTime = TimeCurrent();
+   MqlDateTime dt;
+   TimeToStruct(serverTime, dt);
+   
+   string currentSession1 = "";
+   string currentSession2 = "";
+   
+   // Determine which day's sessions to check
+   switch(dt.day_of_week)
+   {
+      case 0: // Sunday
+         currentSession1 = SundaySession1;
+         currentSession2 = SundaySession2;
+         break;
+      case 1: // Monday
+         currentSession1 = MondaySession1;
+         currentSession2 = MondaySession2;
+         break;
+      case 2: // Tuesday
+         currentSession1 = TuesdaySession1;
+         currentSession2 = TuesdaySession2;
+         break;
+      case 3: // Wednesday
+         currentSession1 = WednesdaySession1;
+         currentSession2 = WednesdaySession2;
+         break;
+      case 4: // Thursday
+         currentSession1 = ThursdaySession1;
+         currentSession2 = ThursdaySession2;
+         break;
+      case 5: // Friday
+         currentSession1 = FridaySession1;
+         currentSession2 = FridaySession2;
+         break;
+      case 6: // Saturday
+         currentSession1 = SaturdaySession1;
+         currentSession2 = SaturdaySession2;
+         break;
+      default:
+         return false; // Should never reach here
+   }
+   
+   // Check if current time is within session times
+   bool inSession1 = IsTimeInSession(serverTime, currentSession1);
+   bool inSession2 = currentSession2 != "" ? IsTimeInSession(serverTime, currentSession2) : false;
+   
+   return inSession1 || inSession2;
+}
+
+//+------------------------------------------------------------------+
+//| Check if time is within a session                                |
+//+------------------------------------------------------------------+
+bool IsTimeInSession(datetime serverTime, string sessionTime)
+{
+   if(sessionTime == "") return false;
+   
+   // Parse session start and end times
+   string parts[];
+   StringSplit(sessionTime, '-', parts);
+   
+   if(ArraySize(parts) != 2) return false;
+   
+   int startHour = (int)StringSubstr(parts[0], 0, 2);
+   int startMin = (int)StringSubstr(parts[0], 2, 2);
+   int endHour = (int)StringSubstr(parts[1], 0, 2);
+   int endMin = (int)StringSubstr(parts[1], 2, 2);
+   
+   // Get current hours and minutes
+   MqlDateTime dt;
+   TimeToStruct(serverTime, dt);
+   int currentHour = dt.hour;
+   int currentMin = dt.min;
+   
+   // Convert to minutes for easy comparison
+   int startMinutes = startHour * 60 + startMin;
+   int endMinutes = endHour * 60 + endMin;
+   int currentMinutes = currentHour * 60 + currentMin;
+   
+   // Check if current time is in session
+   if(startMinutes <= endMinutes)
+   {
+      // Normal session (e.g., 0900-1700)
+      return (currentMinutes >= startMinutes && currentMinutes <= endMinutes);
+   }
+   else
+   {
+      // Overnight session (e.g., 2200-0600)
+      return (currentMinutes >= startMinutes || currentMinutes <= endMinutes);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Manage open positions (scale-out, breakeven, trailing)           |
+//+------------------------------------------------------------------+
+void ManageOpenPositions()
+{
+   // Get current position
+   if(!PositionSelect(_Symbol)) return;
+   
+   // Check if the position belongs to this EA
+   if(PositionGetInteger(POSITION_MAGIC) != Magic_Number) return;
+   
+   double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+   double positionVolume = PositionGetDouble(POSITION_VOLUME);
+   ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+   
+   // LONG position management
+   if(posType == POSITION_TYPE_BUY)
+   {
+      double distInPips = (Close[0] - entryPrice) / GetPipSize();
+      
+      // Scale-out logic for long positions
+      if(EnableScaleOut && ScaleOut1Enabled && !scaleOut1LongTriggered && pivotTpLongEntry > 0)
+      {
+         // Calculate scale-out price at specified percentage of the target distance
+         double scaleOut1Price = entryPrice + ((pivotTpLongEntry - entryPrice) * ScaleOut1Pct / 100.0);
+         
+         // Execute scale-out when price reaches the level
+         if(Close[0] >= scaleOut1Price)
+         {
+            scaleOut1LongTriggered = true;
+            double partialQty = positionVolume * (ScaleOut1Size / 100.0);
+            
+            if(trade.PositionClosePartial(PositionGetTicket(0), partialQty))
+            {
+               Print("Long position scaled out. Closed: ", DoubleToString(partialQty, 2), 
+                     " at price: ", DoubleToString(Close[0], 5));
+               
+               // Set breakeven if enabled
+               if(ScaleOut1BE && !beAppliedLong && pivotStopLongEntry < entryPrice)
+               {
+                  beAppliedLong = true;
+                  pivotStopLongEntry = entryPrice;
+                  
+                  if(trade.PositionModify(PositionGetTicket(0), entryPrice, pivotTpLongEntry))
+                  {
+                     Print("Long position SL moved to breakeven after scale-out");
+                     
+                     // Signal hedge EA about stop adjustment
+                        if(EnableHedgeCommunication)
+                     {
+                        SendHedgeSignal("MODIFY", "SELL", 0, pivotTpLongEntry, entryPrice);
+                        Print("Hedge modify signal sent: SL adjusted to ", DoubleToString(entryPrice, 5));
+                     }
+                  }
+               }
+               
+               // Signal hedge EA about scale-out
+               if(EnableHedgeCommunication)
+               {
+                  double hedgeScaleOutLots = NormalizeLots(partialQty * hedgeFactor);
+                  SendHedgeSignal("PARTIAL_CLOSE", "SELL", hedgeScaleOutLots, 0, 0);
+                  Print("Hedge partial close signal sent: SELL ", DoubleToString(hedgeScaleOutLots, 2));
+               }
+            }
+         }
+      }
+      
+      // Regular breakeven (separate from scale-out)
+      if(EnableBreakEven && !beAppliedLong && distInPips >= BeTriggerPips)
+      {
+         beAppliedLong = true;
+         double newSL = entryPrice;
+         
+         if(trade.PositionModify(PositionGetTicket(0), newSL, pivotTpLongEntry))
+         {
+            Print("Long position SL moved to breakeven: ", DoubleToString(newSL, 5));
+            pivotStopLongEntry = newSL;
+            
+            // Signal hedge EA about stop adjustment
+            if(EnableHedgeCommunication)
+            {
+               SendHedgeSignal("MODIFY", "SELL", 0, pivotTpLongEntry, newSL);
+               Print("Hedge modify signal sent: SL adjusted to ", DoubleToString(newSL, 5));
+            }
+         }
+      }
+      
+      // Update stop loss if necessary
+      if(pivotStopLongEntry > 0 && pivotStopLongEntry != PositionGetDouble(POSITION_SL))
+      {
+         if(trade.PositionModify(PositionGetTicket(0), pivotStopLongEntry, pivotTpLongEntry))
+         {
+            Print("Long position SL/TP updated: SL=", DoubleToString(pivotStopLongEntry, 5), 
+                  ", TP=", DoubleToString(pivotTpLongEntry, 5));
+         }
+      }
+   }
+   
+   // SHORT position management
+   if(posType == POSITION_TYPE_SELL)
+   {
+      double distInPips = (entryPrice - Close[0]) / GetPipSize();
+      
+      // Scale-out logic for short positions
+      if(EnableScaleOut && ScaleOut1Enabled && !scaleOut1ShortTriggered && pivotTpShortEntry > 0)
+      {
+         // Calculate scale-out price at specified percentage of the target distance
+         double scaleOut1Price = entryPrice - ((entryPrice - pivotTpShortEntry) * ScaleOut1Pct / 100.0);
+         
+         // Execute scale-out when price reaches the level
+         if(Close[0] <= scaleOut1Price)
+         {
+            scaleOut1ShortTriggered = true;
+            double partialQty = positionVolume * (ScaleOut1Size / 100.0);
+            
+            if(trade.PositionClosePartial(PositionGetTicket(0), partialQty))
+            {
+               Print("Short position scaled out. Closed: ", DoubleToString(partialQty, 2), 
+                     " at price: ", DoubleToString(Close[0], 5));
+               
+               // Set breakeven if enabled
+               if(ScaleOut1BE && !beAppliedShort && pivotStopShortEntry > entryPrice)
+               {
+                  beAppliedShort = true;
+                  pivotStopShortEntry = entryPrice;
+                  
+                  if(trade.PositionModify(PositionGetTicket(0), entryPrice, pivotTpShortEntry))
+                  {
+                     Print("Short position SL moved to breakeven after scale-out");
+                     
+                     // Signal hedge EA about stop adjustment
+                     if(EnableHedgeCommunication)
+                     {
+                        SendHedgeSignal("MODIFY", "BUY", 0, pivotTpShortEntry, entryPrice);
+                        Print("Hedge modify signal sent: SL adjusted to ", DoubleToString(entryPrice, 5));
+                     }
+                  }
+               }
+               
+               // Signal hedge EA about scale-out
+               if(EnableHedgeCommunication)
+               {
+                  double hedgeScaleOutLots = NormalizeLots(partialQty * hedgeFactor);
+                  SendHedgeSignal("PARTIAL_CLOSE", "BUY", hedgeScaleOutLots, 0, 0);
+                  Print("Hedge partial close signal sent: BUY ", DoubleToString(hedgeScaleOutLots, 2));
+               }
+            }
+         }
+      }
+      
+      // Regular breakeven (separate from scale-out)
+      if(EnableBreakEven && !beAppliedShort && distInPips >= BeTriggerPips)
+      {
+         beAppliedShort = true;
+         double newSL = entryPrice;
+         
+         if(trade.PositionModify(PositionGetTicket(0), newSL, pivotTpShortEntry))
+         {
+            Print("Short position SL moved to breakeven: ", DoubleToString(newSL, 5));
+            pivotStopShortEntry = newSL;
+            
+            // Signal hedge EA about stop adjustment
+            if(EnableHedgeCommunication)
+            {
+               SendHedgeSignal("MODIFY", "BUY", 0, pivotTpShortEntry, newSL);
+               Print("Hedge modify signal sent: SL adjusted to ", DoubleToString(newSL, 5));
+            }
+         }
+      }
+      
+      // Update stop loss if necessary
+      if(pivotStopShortEntry > 0 && pivotStopShortEntry != PositionGetDouble(POSITION_SL))
+      {
+         if(trade.PositionModify(PositionGetTicket(0), pivotStopShortEntry, pivotTpShortEntry))
+         {
+            Print("Short position SL/TP updated: SL=", DoubleToString(pivotStopShortEntry, 5), 
+                  ", TP=", DoubleToString(pivotTpShortEntry, 5));
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Generic order opener (replaces the long / short duplication)     |
+//+------------------------------------------------------------------+
+void OpenTrade(bool isLong, const double sl, const double tp)
+{
+   //––– lot-size
+   double slPips = MathAbs(Close[0]-sl) / GetPipSize();
+   
+   Print("OpenTrade: UseFixedLot=", UseFixedLot, ", FixedLotSize=", FixedLotSize, ", RiskPercent=", RiskPercent);
+   
+   double rawLots;
+   if(UseFixedLot) {
+      rawLots = FixedLotSize;
+      Print("Using fixed lot size: ", FixedLotSize);
+   } else {
+      rawLots = CalculatePositionSize(slPips, RiskPercent);
+      Print("Using risk-based lot size: ", rawLots, " (SL pips: ", slPips, ", Risk%: ", RiskPercent, ")");
+   }
+   
+   double lots = NormalizeLots(rawLots);
+   Print("Final normalized lot size: ", lots);
+
+   //––– hedge volume
+   double lotLive = NormalizeLots(lots * hedgeFactor);
+
+   // record for later
+   lastEntryLots = lots;
+   hedgeLotsLast = lotLive;
+
+   //––– place main order
+   bool ok = isLong
+             ? trade.Buy(lots, _Symbol, 0, sl, tp, "Long")
+             : trade.Sell(lots, _Symbol, 0, sl, tp, "Short");
+
+   if(!ok) { 
+      Print("OpenTrade(): order failed – ", GetLastError());
       return;
    }
-   
-   // CRITICAL FIX: Adjust SL/TP for hedge direction
-   double adjustedSL = sl;
-   double adjustedTP = tp;
-   
-   if(signalType == "OPEN")
+
+   // reset per-side flags
+   if(isLong) { scaleOut1LongTriggered = false; beAppliedLong = false; }
+   else { scaleOut1ShortTriggered = false; beAppliedShort = false; }
+
+   //––– fire hedge order
+   if(EnableHedgeCommunication)
+      SendHedgeSignal("OPEN", isLong? "SELL":"BUY", lotLive, tp, sl);
+}
+
+
+//+------------------------------------------------------------------+
+//| One-liner wrapper for bleed logic                                |
+//+------------------------------------------------------------------+
+void CheckBleedCondition()
+{
+   double curProfit = AccountInfoDouble(ACCOUNT_BALANCE) - initialBalance;
+
+   if(!bleedDone &&
+      curProfit >= StageTarget*0.70 &&
+      EnableHedgeCommunication)
    {
-      double currentPrice = Close[0];
-      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      bleedDone = true;
+      SendHedgeBleedSignal();
+      Print("Hedge bleed signal sent – 70 % of stage target reached");
+   }
+}
+
+//────────────────────────────────────────────────────────────────────
+// 4.  PIVOT‑SCAN FUNCTIONS  (fully replaced)                       
+//────────────────────────────────────────────────────────────────────
+
+double FindDeepestPivotLowBelowClose(int lookbackBars)
+{
+   int total = ArraySize(Low);
+   if(total==0) return 0;
+   int maxLook = MathMin(lookbackBars, total-PivotLengthRight-1);
+   double deepest = 0;
+   for(int i=PivotLengthRight; i<=maxLook; i++)
+   {
+      double cand = Low[i]; bool isPivot=true;
+      for(int l=1; l<=PivotLengthLeft && isPivot; l++)
+         if(i+l<total && Low[i+l] < cand) isPivot=false;
+      for(int r=1; r<=PivotLengthRight && isPivot; r++)
+         if(i-r>=0   && Low[i-r] < cand) isPivot=false;
+      if(isPivot && cand<Close[0] && (deepest==0||cand<deepest)) deepest=cand;
+   }
+   return deepest;
+}
+
+double FindHighestPivotHighAboveClose(int lookbackBars)
+{
+   int total = ArraySize(High);
+   if(total==0) return 0;
+   int maxLook = MathMin(lookbackBars, total-PivotLengthRight-1);
+   double highest = 0;
+   for(int i=PivotLengthRight; i<=maxLook; i++)
+   {
+      double cand = High[i]; bool isPivot=true;
+      for(int l=1; l<=PivotLengthLeft && isPivot; l++)
+         if(i+l<total && High[i+l] > cand) isPivot=false;
+      for(int r=1; r<=PivotLengthRight && isPivot; r++)
+         if(i-r>=0   && High[i-r] > cand) isPivot=false;
+      if(isPivot && cand>Close[0] && (highest==0||cand>highest)) highest=cand;
+   }
+   return highest;
+}
+
+//+------------------------------------------------------------------+
+//| Initialize Synergy Score indicators                              |
+//+------------------------------------------------------------------+
+bool InitSynergyIndicators()
+{
+   // 5 Minute Timeframe
+   if(UseTF5min)
+   {
+      rsiHandle_M5 = iRSI(_Symbol, PERIOD_M5, 14, PRICE_CLOSE);
+      maFastHandle_M5 = iMA(_Symbol, PERIOD_M5, 10, 0, MODE_EMA, PRICE_CLOSE);
+      maSlowHandle_M5 = iMA(_Symbol, PERIOD_M5, 100, 0, MODE_EMA, PRICE_CLOSE);
+      macdHandle_M5 = iMACD(_Symbol, PERIOD_M5, 12, 26, 9, PRICE_CLOSE);
       
-      Print("=== HEDGE SIGNAL ADJUSTMENT ===");
-      Print("Main trade SL: ", DoubleToString(sl, 5), " TP: ", DoubleToString(tp, 5));
-      Print("Current Ask: ", DoubleToString(ask, 5), " Bid: ", DoubleToString(bid, 5));
-      Print("Hedge Direction: ", direction);
-      
-      if(direction == "SELL") // Hedge for LONG main trade
+      if(rsiHandle_M5 == INVALID_HANDLE || maFastHandle_M5 == INVALID_HANDLE || 
+         maSlowHandle_M5 == INVALID_HANDLE || macdHandle_M5 == INVALID_HANDLE)
       {
-         // For hedge SELL: SL should be above entry, TP should be below entry
-         // We need to ensure SL > current price and TP < current price
-         if(sl < bid) // Original SL is below current price (from LONG trade)
-         {
-            // Swap: Use main TP as hedge SL, main SL as hedge TP
-            adjustedSL = tp;  // Main TP becomes hedge SL (above price)
-            adjustedTP = sl;  // Main SL becomes hedge TP (below price)
-            Print("🔄 HEDGE SELL: Swapped SL/TP");
-            Print("   Adjusted SL: ", DoubleToString(adjustedSL, 5), " (was TP)");
-            Print("   Adjusted TP: ", DoubleToString(adjustedTP, 5), " (was SL)");
-         }
+         Print("Error initializing 5 minute indicators: ", GetLastError());
+         return false;
       }
-      else if(direction == "BUY") // Hedge for SHORT main trade
+   }
+   
+   // 15 Minute Timeframe
+   if(UseTF15min)
+   {
+      rsiHandle_M15 = iRSI(_Symbol, PERIOD_M15, 14, PRICE_CLOSE);
+      maFastHandle_M15 = iMA(_Symbol, PERIOD_M15, 50, 0, MODE_EMA, PRICE_CLOSE);
+      maSlowHandle_M15 = iMA(_Symbol, PERIOD_M15, 200, 0, MODE_EMA, PRICE_CLOSE);
+      macdHandle_M15 = iMACD(_Symbol, PERIOD_M15, 12, 26, 9, PRICE_CLOSE);
+      
+      if(rsiHandle_M15 == INVALID_HANDLE || maFastHandle_M15 == INVALID_HANDLE || 
+         maSlowHandle_M15 == INVALID_HANDLE || macdHandle_M15 == INVALID_HANDLE)
       {
-         // For hedge BUY: SL should be below entry, TP should be above entry
-         if(sl > ask) // Original SL is above current price (from SHORT trade)
+         Print("Error initializing 15 minute indicators: ", GetLastError());
+         return false;
+      }
+   }
+   
+   // 1 Hour Timeframe
+   if(UseTF1hour)
+   {
+      rsiHandle_H1 = iRSI(_Symbol, PERIOD_H1, 14, PRICE_CLOSE);
+      maFastHandle_H1 = iMA(_Symbol, PERIOD_H1, 50, 0, MODE_EMA, PRICE_CLOSE);
+      maSlowHandle_H1 = iMA(_Symbol, PERIOD_H1, 200, 0, MODE_EMA, PRICE_CLOSE);
+      macdHandle_H1 = iMACD(_Symbol, PERIOD_H1, 12, 26, 9, PRICE_CLOSE);
+      
+      if(rsiHandle_H1 == INVALID_HANDLE || maFastHandle_H1 == INVALID_HANDLE || 
+         maSlowHandle_H1 == INVALID_HANDLE || macdHandle_H1 == INVALID_HANDLE)
+      {
+         Print("Error initializing 1 hour indicators: ", GetLastError());
+         return false;
+      }
+   }
+   
+   // Allocate arrays
+   ArraySetAsSeries(rsiBuffer_M5, true);
+   ArraySetAsSeries(maFastBuffer_M5, true);
+   ArraySetAsSeries(maSlowBuffer_M5, true);
+   ArraySetAsSeries(macdBuffer_M5, true);
+   ArraySetAsSeries(macdPrevBuffer_M5, true);
+   
+   ArraySetAsSeries(rsiBuffer_M15, true);
+   ArraySetAsSeries(maFastBuffer_M15, true);
+   ArraySetAsSeries(maSlowBuffer_M15, true);
+   ArraySetAsSeries(macdBuffer_M15, true);
+   ArraySetAsSeries(macdPrevBuffer_M15, true);
+   
+   ArraySetAsSeries(rsiBuffer_H1, true);
+   ArraySetAsSeries(maFastBuffer_H1, true);
+   ArraySetAsSeries(maSlowBuffer_H1, true);
+   ArraySetAsSeries(macdBuffer_H1, true);
+   ArraySetAsSeries(macdPrevBuffer_H1, true);
+   
+   return true;
+}
+
+//--------------------------------------------------------------------
+// 5.  SYNERGY SCORE  (identical maths, wrapped with CopyOk)         
+//--------------------------------------------------------------------
+double CalculateSynergyScore()
+{
+   if(!UseSynergyScore) return 0;
+   double score=0;
+   // ── 5‑min ──
+   if(UseTF5min)
+   {
+      if(!CopyOk(2,CopyBuffer(rsiHandle_M5,0,0,2,rsiBuffer_M5))) return 0;
+      if(!CopyOk(2,CopyBuffer(maFastHandle_M5,0,0,2,maFastBuffer_M5))) return 0;
+      if(!CopyOk(2,CopyBuffer(maSlowHandle_M5,0,0,2,maSlowBuffer_M5))) return 0;
+      if(!CopyOk(2,CopyBuffer(macdHandle_M5,0,0,2,macdBuffer_M5))) return 0;
+      if(!CopyOk(2,CopyBuffer(macdHandle_M5,0,1,2,macdPrevBuffer_M5))) return 0;
+      score += SynergyAdd(rsiBuffer_M5[0]>50, rsiBuffer_M5[0]<50, RSI_Weight, Weight_M5);
+      score += SynergyAdd(maFastBuffer_M5[0]>maSlowBuffer_M5[0], maFastBuffer_M5[0]<maSlowBuffer_M5[0], Trend_Weight, Weight_M5);
+      score += SynergyAdd(macdBuffer_M5[0]>macdPrevBuffer_M5[0], macdBuffer_M5[0]<macdPrevBuffer_M5[0], MACDV_Slope_Weight, Weight_M5);
+   }
+   // ── 15‑min ──
+   if(UseTF15min)
+   {
+      if(!CopyOk(2,CopyBuffer(rsiHandle_M15,0,0,2,rsiBuffer_M15))) return 0;
+      if(!CopyOk(2,CopyBuffer(maFastHandle_M15,0,0,2,maFastBuffer_M15))) return 0;
+      if(!CopyOk(2,CopyBuffer(maSlowHandle_M15,0,0,2,maSlowBuffer_M15))) return 0;
+      if(!CopyOk(2,CopyBuffer(macdHandle_M15,0,0,2,macdBuffer_M15))) return 0;
+      if(!CopyOk(2,CopyBuffer(macdHandle_M15,0,1,2,macdPrevBuffer_M15))) return 0;
+      score += SynergyAdd(rsiBuffer_M15[0]>50, rsiBuffer_M15[0]<50, RSI_Weight, Weight_M15);
+      score += SynergyAdd(maFastBuffer_M15[0]>maSlowBuffer_M15[0], maFastBuffer_M15[0]<maSlowBuffer_M15[0], Trend_Weight, Weight_M15);
+      score += SynergyAdd(macdBuffer_M15[0]>macdPrevBuffer_M15[0], macdBuffer_M15[0]<macdPrevBuffer_M15[0], MACDV_Slope_Weight, Weight_M15);
+   }
+   // ── 1‑hour ──
+   if(UseTF1hour)
+   {
+      if(!CopyOk(2,CopyBuffer(rsiHandle_H1,0,0,2,rsiBuffer_H1))) return 0;
+      if(!CopyOk(2,CopyBuffer(maFastHandle_H1,0,0,2,maFastBuffer_H1))) return 0;
+      if(!CopyOk(2,CopyBuffer(maSlowHandle_H1,0,0,2,maSlowBuffer_H1))) return 0;
+      if(!CopyOk(2,CopyBuffer(macdHandle_H1,0,0,2,macdBuffer_H1))) return 0;
+      if(!CopyOk(2,CopyBuffer(macdHandle_H1,0,1,2,macdPrevBuffer_H1))) return 0;
+      score += SynergyAdd(rsiBuffer_H1[0]>50, rsiBuffer_H1[0]<50, RSI_Weight, Weight_H1);
+      score += SynergyAdd(maFastBuffer_H1[0]>maSlowBuffer_H1[0], maFastBuffer_H1[0]<maSlowBuffer_H1[0], Trend_Weight, Weight_H1);
+      score += SynergyAdd(macdBuffer_H1[0]>macdPrevBuffer_H1[0], macdBuffer_H1[0]<macdPrevBuffer_H1[0], MACDV_Slope_Weight, Weight_H1);
+   }
+   synergyScore=score; return score;
+}
+
+//+------------------------------------------------------------------+
+//| Helper function for Synergy Score calculation                     |
+//+------------------------------------------------------------------+
+double SynergyAdd(bool aboveCondition, bool belowCondition, double factor, double timeFactor)
+{
+   if(aboveCondition) return factor * timeFactor;
+   if(belowCondition) return -(factor * timeFactor);
+   return 0;
+}
+
+//+------------------------------------------------------------------+
+//| Release Synergy Score indicator handles                          |
+//+------------------------------------------------------------------+
+void ReleaseSynergyIndicators()
+{
+   // Release indicator handles
+   if(rsiHandle_M5 != INVALID_HANDLE) IndicatorRelease(rsiHandle_M5);
+   if(maFastHandle_M5 != INVALID_HANDLE) IndicatorRelease(maFastHandle_M5);
+   if(maSlowHandle_M5 != INVALID_HANDLE) IndicatorRelease(maSlowHandle_M5);
+   if(macdHandle_M5 != INVALID_HANDLE) IndicatorRelease(macdHandle_M5);
+   
+   if(rsiHandle_M15 != INVALID_HANDLE) IndicatorRelease(rsiHandle_M15);
+   if(maFastHandle_M15 != INVALID_HANDLE) IndicatorRelease(maFastHandle_M15);
+   if(maSlowHandle_M15 != INVALID_HANDLE) IndicatorRelease(maSlowHandle_M15);
+   if(macdHandle_M15 != INVALID_HANDLE) IndicatorRelease(macdHandle_M15);
+   
+   if(rsiHandle_H1 != INVALID_HANDLE) IndicatorRelease(rsiHandle_H1);
+   if(maFastHandle_H1 != INVALID_HANDLE) IndicatorRelease(maFastHandle_H1);
+   if(maSlowHandle_H1 != INVALID_HANDLE) IndicatorRelease(maSlowHandle_H1);
+   if(macdHandle_H1 != INVALID_HANDLE) IndicatorRelease(macdHandle_H1);
+}
+
+//+------------------------------------------------------------------+
+//| Initialize Market Bias indicator                                 |
+//+------------------------------------------------------------------+
+bool InitMarketBias()
+{
+   if(!UseMarketBias) return true;
+   
+   // Get the appropriate timeframe
+   ENUM_TIMEFRAMES tf = GetTimeframeFromString(BiasTimeframe);
+   
+   // Create Heikin-Ashi indicator handle
+   haHandle = iCustom(_Symbol, tf, "Heiken_Ashi");
+   
+   if(haHandle == INVALID_HANDLE)
+   {
+      Print("Error initializing Heikin Ashi indicator: ", GetLastError());
+      return false;
+   }
+   
+   // Set arrays as series
+   ArraySetAsSeries(haOpen, true);
+   ArraySetAsSeries(haHigh, true);
+   ArraySetAsSeries(haLow, true);
+   ArraySetAsSeries(haClose, true);
+   
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate Market Bias                                             |
+//+------------------------------------------------------------------+
+bool CalculateMarketBias()
+{
+   if(!UseMarketBias) return true;
+   
+   // Get the appropriate timeframe
+   ENUM_TIMEFRAMES tf = GetTimeframeFromString(BiasTimeframe);
+   
+   // Copy Heikin Ashi values
+   if(CopyBuffer(haHandle, 0, 0, HeikinAshiPeriod+1, haOpen) <= 0) return false;
+   if(CopyBuffer(haHandle, 1, 0, HeikinAshiPeriod+1, haHigh) <= 0) return false;
+   if(CopyBuffer(haHandle, 2, 0, HeikinAshiPeriod+1, haLow) <= 0) return false;
+   if(CopyBuffer(haHandle, 3, 0, HeikinAshiPeriod+1, haClose) <= 0) return false;
+   
+   // Calculate smoothed values using manual EMA calculation instead of function
+   double o = CalculateEMAValue(haOpen, HeikinAshiPeriod);
+   double h = CalculateEMAValue(haHigh, HeikinAshiPeriod);
+   double l = CalculateEMAValue(haLow, HeikinAshiPeriod);
+   double c = CalculateEMAValue(haClose, HeikinAshiPeriod);
+   
+   // Calculate oscillator
+   oscBias = 100 * (c - o);
+   
+   // Calculate smooth oscillator with manual EMA
+   double alphaOsc = 2.0 / (OscillatorPeriod + 1);
+   
+   static double lastOscSmooth = 0;
+   if(lastOscSmooth == 0) lastOscSmooth = oscBias;
+   
+   oscSmooth = (oscBias - lastOscSmooth) * alphaOsc + lastOscSmooth;
+   lastOscSmooth = oscSmooth;
+   
+   // Detect bias changes
+   prevBiasPositive = currentBiasPositive;
+   currentBiasPositive = oscBias > 0;
+   
+   biasChangedToBullish = !prevBiasPositive && currentBiasPositive;
+   biasChangedToBearish = prevBiasPositive && !currentBiasPositive;
+   
+   return true;
+}
+
+//────────────────────────────────────────────────────────────────────
+// 6.  SAFE EMA CALC                                                 
+//────────────────────────────────────────────────────────────────────
+
+double CalculateEMAValue(double &array[], int period)
+{
+   int len = ArraySize(array);
+   if(len==0) return 0;
+   if(len<period) period=len;
+   double alpha=2.0/(period+1);
+   double ema=array[period-1];
+   for(int i=period-2;i>=0;i--)
+      ema = (array[i]-ema)*alpha + ema;
+   return ema;
+}
+
+//+------------------------------------------------------------------+
+//| Release Market Bias indicator handle                              |
+//+------------------------------------------------------------------+
+void ReleaseMarketBias()
+{
+   if(haHandle != INVALID_HANDLE)
+      IndicatorRelease(haHandle);
+}
+
+//+------------------------------------------------------------------+
+//| Initialize ADX Filter                                             |
+//+------------------------------------------------------------------+
+bool InitADXFilter()
+{
+   if(!EnableADXFilter) return true;
+   
+   // Create ADX indicator handle
+   adxHandle = iADX(_Symbol, PERIOD_CURRENT, ADXPeriod);
+   
+   if(adxHandle == INVALID_HANDLE)
+   {
+      Print("Error initializing ADX indicator: ", GetLastError());
+      return false;
+   }
+   
+   // Set arrays as series
+   ArraySetAsSeries(adxMain, true);
+   ArraySetAsSeries(adxPlus, true);
+   ArraySetAsSeries(adxMinus, true);
+   
+   return true;
+}
+
+//────────────────────────────────────────────────────────────────────
+// 7.  ADX FILTER – history guard                                    
+//────────────────────────────────────────────────────────────────────
+
+bool CalculateADXFilter()
+{
+   if(!EnableADXFilter){ adxTrendCondition=true; return true; }
+   int need = ADXLookbackPeriod+1;
+   if(CopyBuffer(adxHandle,0,0,need,adxMain)  < need) { adxTrendCondition=false; return false; }
+   if(CopyBuffer(adxHandle,1,0,1,adxPlus)    < 1   ) { adxTrendCondition=false; return false; }
+   if(CopyBuffer(adxHandle,2,0,1,adxMinus)   < 1   ) { adxTrendCondition=false; return false; }
+   double adxAvg=0;
+   if(UseDynamicADX)
+   {
+      for(int i=0;i<ADXLookbackPeriod;i++) adxAvg+=adxMain[i];
+      adxAvg/=ADXLookbackPeriod;
+      effectiveADXThreshold = MathMax(ADXMinThreshold, adxAvg*ADXMultiplier);
+   }
+   else effectiveADXThreshold = StaticADXThreshold;
+   adxTrendCondition = adxMain[0] > effectiveADXThreshold;
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Release ADX Filter indicator handle                               |
+//+------------------------------------------------------------------+
+void ReleaseADXFilter()
+{
+   if(adxHandle != INVALID_HANDLE)
+      IndicatorRelease(adxHandle);
+}
+
+//+------------------------------------------------------------------+
+//| Convert string timeframe to ENUM_TIMEFRAMES                       |
+//+------------------------------------------------------------------+
+ENUM_TIMEFRAMES GetTimeframeFromString(string tfString)
+{
+   if(tfString == "current") return PERIOD_CURRENT;
+   if(tfString == "M1") return PERIOD_M1;
+   if(tfString == "M5") return PERIOD_M5;
+   if(tfString == "M15") return PERIOD_M15;
+   if(tfString == "M30") return PERIOD_M30;
+   if(tfString == "H1") return PERIOD_H1;
+   if(tfString == "H4") return PERIOD_H4;
+   if(tfString == "D1") return PERIOD_D1;
+   if(tfString == "W1") return PERIOD_W1;
+   if(tfString == "MN1") return PERIOD_MN1;
+   
+   // Default to current timeframe
+   return PERIOD_CURRENT;
+}
+
+//+------------------------------------------------------------------+
+//| Dashboard Variables                                               |
+//+------------------------------------------------------------------+
+string dashboardPrefix = "PropEA_Dashboard_";
+color headerBgColor = clrGold;
+color sectionHeaderBg = clrBlack;
+color dataBgColor = clrIndigo;
+color textColor = clrWhite;
+color statusGreen = clrLime;
+color statusRed = clrRed;
+color costRecoveryHeaderBg = clrGold;
+color costRecoveryCriteriaBg = clrGray;
+
+//+------------------------------------------------------------------+
+//| Create Dashboard                                                  |
+//+------------------------------------------------------------------+
+void CreateDashboard()
+{
+   // Remove any existing dashboard objects
+   DeleteDashboard();
+   
+   // Create background panel
+   ObjectCreate(0, dashboardPrefix + "BG", OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, dashboardPrefix + "BG", OBJPROP_XDISTANCE, 10);
+   ObjectSetInteger(0, dashboardPrefix + "BG", OBJPROP_YDISTANCE, 10);
+   ObjectSetInteger(0, dashboardPrefix + "BG", OBJPROP_XSIZE, 500);  // Widened to match screenshot
+   ObjectSetInteger(0, dashboardPrefix + "BG", OBJPROP_YSIZE, 600);
+   ObjectSetInteger(0, dashboardPrefix + "BG", OBJPROP_BGCOLOR, dataBgColor);
+   ObjectSetInteger(0, dashboardPrefix + "BG", OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, dashboardPrefix + "BG", OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, dashboardPrefix + "BG", OBJPROP_STYLE, STYLE_SOLID);
+   ObjectSetInteger(0, dashboardPrefix + "BG", OBJPROP_WIDTH, 1);
+   ObjectSetInteger(0, dashboardPrefix + "BG", OBJPROP_BACK, false);
+   ObjectSetInteger(0, dashboardPrefix + "BG", OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, dashboardPrefix + "BG", OBJPROP_SELECTED, false);
+   ObjectSetInteger(0, dashboardPrefix + "BG", OBJPROP_HIDDEN, true);
+   ObjectSetInteger(0, dashboardPrefix + "BG", OBJPROP_ZORDER, 0);
+   
+   // Create header background
+   ObjectCreate(0, dashboardPrefix + "HeaderBG", OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, dashboardPrefix + "HeaderBG", OBJPROP_XDISTANCE, 10);
+   ObjectSetInteger(0, dashboardPrefix + "HeaderBG", OBJPROP_YDISTANCE, 10);
+   ObjectSetInteger(0, dashboardPrefix + "HeaderBG", OBJPROP_XSIZE, 500);
+   ObjectSetInteger(0, dashboardPrefix + "HeaderBG", OBJPROP_YSIZE, 90);
+   ObjectSetInteger(0, dashboardPrefix + "HeaderBG", OBJPROP_BGCOLOR, headerBgColor);
+   ObjectSetInteger(0, dashboardPrefix + "HeaderBG", OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, dashboardPrefix + "HeaderBG", OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, dashboardPrefix + "HeaderBG", OBJPROP_STYLE, STYLE_SOLID);
+   ObjectSetInteger(0, dashboardPrefix + "HeaderBG", OBJPROP_WIDTH, 1);
+   ObjectSetInteger(0, dashboardPrefix + "HeaderBG", OBJPROP_BACK, false);
+   ObjectSetInteger(0, dashboardPrefix + "HeaderBG", OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, dashboardPrefix + "HeaderBG", OBJPROP_SELECTED, false);
+   ObjectSetInteger(0, dashboardPrefix + "HeaderBG", OBJPROP_HIDDEN, true);
+   ObjectSetInteger(0, dashboardPrefix + "HeaderBG", OBJPROP_ZORDER, 1);
+   
+   // Add Title
+   CreateLabel(dashboardPrefix + "Title", _Symbol + " Synergy + PropEA Hedge", 250, 25, clrBlack, 14, "Arial Bold", true);
+   
+   // Add header items
+   CreateLabel(dashboardPrefix + "LicenseTypeLabel", "License Type", 20, 50, clrBlack, 10);
+   CreateLabel(dashboardPrefix + "LicenseTypeValue", "TESTER", 150, 50, clrBlack, 10);
+   
+   CreateLabel(dashboardPrefix + "VersionLabel", "Version", 20, 70, clrBlack, 10);
+   CreateLabel(dashboardPrefix + "VersionValue", "1.00", 150, 70, clrBlack, 10);
+   
+   CreateLabel(dashboardPrefix + "StatusLabel", "Status", 20, 90, clrBlack, 10);
+   CreateLabel(dashboardPrefix + "StatusValue", "Connected / Working", 150, 90, statusGreen, 10);
+   
+   // Phase Indicator
+   CreateLabel(dashboardPrefix + "PhaseLabel", "Phase", 300, 50, clrBlack, 10);
+   CreateLabel(dashboardPrefix + "PhaseValue", IntegerToString(CurrentPhase), 380, 50, clrBlack, 10);
+   
+   // Live Trading Information Section
+   int y = 110;
+   CreateSectionHeader("Live Trading Information", y);
+   y += 25;
+   
+   CreateDataRow("Volume", "0.00", "0.00", y);
+   y += 20;
+   
+   CreateDataRow("Daily PnL", "0.00", "0.00", y);
+   y += 20;
+   
+   CreateDataRow("Summary PnL", "0.00 / " + DoubleToString(MaxDD, 2), "0.00 / " + DoubleToString(ChallengeC, 2), y);
+   y += 20;
+   
+   CreateDataRow("Trading Days", "0 / 0", "", y);
+   y += 20;
+   
+   // Account Status Section
+   CreateSectionHeader("Account Status", y);
+   y += 25;
+   
+   CreateDataRow("Account", IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)), "N/A", y);
+   y += 20;
+   
+   CreateDataRow("Account Currency", AccountInfoString(ACCOUNT_CURRENCY), AccountInfoString(ACCOUNT_CURRENCY), y);
+   y += 20;
+   
+   CreateDataRow("Free margin", DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_FREE), 2), "N/A", y);
+   y += 20;
+   
+   CreateDataRow("Symbol", _Symbol, _Symbol, y);
+   y += 20;
+   
+   CreateDataRow("Daily DD Type", "Balance & Equity", "", y);
+   y += 20;
+   
+   CreateDataRow("Today Allowed DD", DoubleToString(dailyDD, 2) + " / " + DoubleToString(dailyDD, 2), "100.0 %", y);
+   y += 20;
+   
+   CreateDataRow("Max Allowed DD", DoubleToString(MaxDD, 2) + " / " + DoubleToString(MaxDD, 2), "100.0 %", y);
+   y += 20;
+   
+   CreateLabel(dashboardPrefix+"LinkLabel",  "Hedge Link", 300, 70, clrBlack, 10);
+   CreateLabel(dashboardPrefix+"LinkValue",  "--",         380, 70, clrRed  , 10);
+   // Cost Recovery Section
+   y += 20;
+   CreateCostRecoverySection(y);
+   
+   // Add visual info for Market Bias & Synergy Score
+   y += 100;
+   CreateSectionHeader("Strategy Status", y);
+   y += 25;
+   
+   ObjectCreate(0, dashboardPrefix + "BiasLabel", OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, dashboardPrefix + "BiasLabel", OBJPROP_XDISTANCE, 20);
+   ObjectSetInteger(0, dashboardPrefix + "BiasLabel", OBJPROP_YDISTANCE, y);
+   ObjectSetString(0, dashboardPrefix + "BiasLabel", OBJPROP_TEXT, "Market Bias:");
+   ObjectSetInteger(0, dashboardPrefix + "BiasLabel", OBJPROP_COLOR, textColor);
+   
+   ObjectCreate(0, dashboardPrefix + "BiasIndicator", OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, dashboardPrefix + "BiasIndicator", OBJPROP_XDISTANCE, 150);
+   ObjectSetInteger(0, dashboardPrefix + "BiasIndicator", OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, dashboardPrefix + "BiasIndicator", OBJPROP_XSIZE, 15);
+   ObjectSetInteger(0, dashboardPrefix + "BiasIndicator", OBJPROP_YSIZE, 15);
+   ObjectSetInteger(0, dashboardPrefix + "BiasIndicator", OBJPROP_BGCOLOR, currentBiasPositive ? BullishColor : BearishColor);
+   
+   y += 20;
+   
+   ObjectCreate(0, dashboardPrefix + "SynergyLabel", OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, dashboardPrefix + "SynergyLabel", OBJPROP_XDISTANCE, 20);
+   ObjectSetInteger(0, dashboardPrefix + "SynergyLabel", OBJPROP_YDISTANCE, y);
+   ObjectSetString(0, dashboardPrefix + "SynergyLabel", OBJPROP_TEXT, "Synergy Score:");
+   ObjectSetInteger(0, dashboardPrefix + "SynergyLabel", OBJPROP_COLOR, textColor);
+   
+   ObjectCreate(0, dashboardPrefix + "SynergyValue", OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, dashboardPrefix + "SynergyValue", OBJPROP_XDISTANCE, 150);
+   ObjectSetInteger(0, dashboardPrefix + "SynergyValue", OBJPROP_YDISTANCE, y);
+   ObjectSetString(0, dashboardPrefix + "SynergyValue", OBJPROP_TEXT, DoubleToString(synergyScore, 2));
+   ObjectSetInteger(0, dashboardPrefix + "SynergyValue", OBJPROP_COLOR, synergyScore > 0 ? BullishColor : (synergyScore < 0 ? BearishColor : textColor));
+   
+   y += 20;
+   
+   ObjectCreate(0, dashboardPrefix + "ADXLabel", OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, dashboardPrefix + "ADXLabel", OBJPROP_XDISTANCE, 20);
+   ObjectSetInteger(0, dashboardPrefix + "ADXLabel", OBJPROP_YDISTANCE, y);
+   ObjectSetString(0, dashboardPrefix + "ADXLabel", OBJPROP_TEXT, "ADX Status:");
+   ObjectSetInteger(0, dashboardPrefix + "ADXLabel", OBJPROP_COLOR, textColor);
+   
+   ObjectCreate(0, dashboardPrefix + "ADXValue", OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, dashboardPrefix + "ADXValue", OBJPROP_XDISTANCE, 150);
+   ObjectSetInteger(0, dashboardPrefix + "ADXValue", OBJPROP_YDISTANCE, y);
+   ObjectSetString(0, dashboardPrefix + "ADXValue", OBJPROP_TEXT, adxTrendCondition ? "Active" : "Waiting");
+   ObjectSetInteger(0, dashboardPrefix + "ADXValue", OBJPROP_COLOR, adxTrendCondition ? statusGreen : statusRed);
+   
+   y += 20;
+   
+   ObjectCreate(0, dashboardPrefix + "TimeLabel", OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, dashboardPrefix + "TimeLabel", OBJPROP_XDISTANCE, 20);
+   ObjectSetInteger(0, dashboardPrefix + "TimeLabel", OBJPROP_YDISTANCE, y);
+   ObjectSetString(0, dashboardPrefix + "TimeLabel", OBJPROP_TEXT, "Last Updated:");
+   ObjectSetInteger(0, dashboardPrefix + "TimeLabel", OBJPROP_COLOR, textColor);
+   
+   ObjectCreate(0, dashboardPrefix + "TimeValue", OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, dashboardPrefix + "TimeValue", OBJPROP_XDISTANCE, 150);
+   ObjectSetInteger(0, dashboardPrefix + "TimeValue", OBJPROP_YDISTANCE, y);
+   ObjectSetString(0, dashboardPrefix + "TimeValue", OBJPROP_TEXT, TimeToString(TimeCurrent(), TIME_SECONDS));
+   ObjectSetInteger(0, dashboardPrefix + "TimeValue", OBJPROP_COLOR, textColor);
+}
+
+//+------------------------------------------------------------------+
+//| Update Dashboard with latest values                               |
+//+------------------------------------------------------------------+
+void UpdateDashboard()
+{
+   // must sit near the top so colour stays fresh
+   bool linkOK = IsLinkAlive(true);
+   ObjectSetString (0, dashboardPrefix+"LinkValue", OBJPROP_TEXT , linkOK ? "OK" : "NOT OK");
+   ObjectSetInteger(0, dashboardPrefix+"LinkValue", OBJPROP_COLOR, linkOK ? statusGreen : statusRed);
+   
+   // Update volumes
+   double propVolume = CalculateTotalVolume();
+   double hedgeVolume = propVolume * hedgeFactor;
+   ObjectSetString(0, dashboardPrefix + "Volume_Prop", OBJPROP_TEXT, DoubleToString(propVolume, 2));
+   ObjectSetString(0, dashboardPrefix + "Volume_Real", OBJPROP_TEXT, DoubleToString(hedgeVolume, 2));
+   
+   // Update PnL values
+   double dailyPnL = CalculateDailyPnL();
+   ObjectSetString(0, dashboardPrefix + "Daily PnL_Prop", OBJPROP_TEXT, DoubleToString(dailyPnL, 2));
+   
+   double totalProfit = AccountInfoDouble(ACCOUNT_BALANCE) - initialBalance;
+   ObjectSetString(0, dashboardPrefix + "Summary PnL_Prop", OBJPROP_TEXT, 
+                  DoubleToString(totalProfit, 2) + " / " + DoubleToString(MaxDD, 2));
+   
+   // Update margin
+   ObjectSetString(0, dashboardPrefix + "Free margin_Prop", OBJPROP_TEXT, 
+                  DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_FREE), 2));
+   
+   // Update Cost Recovery section
+   double propLoss = MathMin(0, totalProfit);
+   double propLossAbs = MathAbs(propLoss);
+   double realProfit = 0; // This would need to be updated from the hedge EA
+   double recoveryPct = propLossAbs > 0 ? (realProfit / propLossAbs) * 100 : 0;
+   
+   ObjectSetString(0, dashboardPrefix + "CR_Loss_Prop", OBJPROP_TEXT, 
+                  propLoss < 0 ? DoubleToString(propLoss, 2) : "0.00");
+   ObjectSetString(0, dashboardPrefix + "CR_Profit_Real", OBJPROP_TEXT, 
+                  DoubleToString(realProfit, 2));
+   ObjectSetString(0, dashboardPrefix + "CR_Recovery", OBJPROP_TEXT, 
+                  DoubleToString(recoveryPct, 1) + " %");
+   
+   // Update Strategy Status indicators
+   ObjectSetInteger(0, dashboardPrefix + "BiasIndicator", OBJPROP_BGCOLOR, 
+                   currentBiasPositive ? BullishColor : BearishColor);
+   
+   ObjectSetString(0, dashboardPrefix + "SynergyValue", OBJPROP_TEXT, 
+                  DoubleToString(synergyScore, 2));
+   ObjectSetInteger(0, dashboardPrefix + "SynergyValue", OBJPROP_COLOR, 
+                   synergyScore > 0 ? BullishColor : (synergyScore < 0 ? BearishColor : textColor));
+   
+   ObjectSetString(0, dashboardPrefix + "ADXValue", OBJPROP_TEXT, 
+                  adxTrendCondition ? "Active" : "Waiting");
+   ObjectSetInteger(0, dashboardPrefix + "ADXValue", OBJPROP_COLOR, 
+                   adxTrendCondition ? statusGreen : statusRed);
+   
+   // Update timestamp
+   ObjectSetString(0, dashboardPrefix + "TimeValue", OBJPROP_TEXT, 
+                  TimeToString(TimeCurrent(), TIME_SECONDS));
+}
+
+//+------------------------------------------------------------------+
+//| Create a section header in the dashboard                          |
+//+------------------------------------------------------------------+
+void CreateSectionHeader(string title, int y)
+{
+   string name = dashboardPrefix + "Section_" + title;
+   
+   // Create background
+   ObjectCreate(0, name + "_BG", OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, name + "_BG", OBJPROP_XDISTANCE, 10);
+   ObjectSetInteger(0, name + "_BG", OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, name + "_BG", OBJPROP_XSIZE, 500);
+   ObjectSetInteger(0, name + "_BG", OBJPROP_YSIZE, 25);
+   ObjectSetInteger(0, name + "_BG", OBJPROP_BGCOLOR, sectionHeaderBg);
+   ObjectSetInteger(0, name + "_BG", OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, name + "_BG", OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name + "_BG", OBJPROP_STYLE, STYLE_SOLID);
+   ObjectSetInteger(0, name + "_BG", OBJPROP_WIDTH, 1);
+   ObjectSetInteger(0, name + "_BG", OBJPROP_BACK, false);
+   ObjectSetInteger(0, name + "_BG", OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name + "_BG", OBJPROP_SELECTED, false);
+   ObjectSetInteger(0, name + "_BG", OBJPROP_HIDDEN, true);
+   ObjectSetInteger(0, name + "_BG", OBJPROP_ZORDER, 2);
+   
+   // Create label
+   CreateLabel(name, title, 250, y + 13, textColor, 10, "Arial Bold", true);
+}
+
+//+------------------------------------------------------------------+
+//| Create a data row with prop and live values                       |
+//+------------------------------------------------------------------+
+void CreateDataRow(string label, string propValue, string liveValue, int y)
+{
+   string name = dashboardPrefix + label;
+   
+   // Create background
+   ObjectCreate(0, name + "_BG", OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, name + "_BG", OBJPROP_XDISTANCE, 10);
+   ObjectSetInteger(0, name + "_BG", OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, name + "_BG", OBJPROP_XSIZE, 500);
+   ObjectSetInteger(0, name + "_BG", OBJPROP_YSIZE, 20);
+   ObjectSetInteger(0, name + "_BG", OBJPROP_BGCOLOR, dataBgColor);
+   ObjectSetInteger(0, name + "_BG", OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, name + "_BG", OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name + "_BG", OBJPROP_STYLE, STYLE_SOLID);
+   ObjectSetInteger(0, name + "_BG", OBJPROP_WIDTH, 1);
+   ObjectSetInteger(0, name + "_BG", OBJPROP_BACK, false);
+   ObjectSetInteger(0, name + "_BG", OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name + "_BG", OBJPROP_SELECTED, false);
+   ObjectSetInteger(0, name + "_BG", OBJPROP_HIDDEN, true);
+   ObjectSetInteger(0, name + "_BG", OBJPROP_ZORDER, 2);
+   
+   // Create label text - improved alignment
+   CreateLabel(name, label, 20, y + 10, textColor, 9, "Arial", false);
+   
+   // Create prop value - fixed position
+   CreateLabel(name + "_Prop", propValue, 200, y + 10, textColor, 9, "Arial", false);
+   
+   // Create live value - fixed position
+   CreateLabel(name + "_Real", liveValue, 350, y + 10, textColor, 9, "Arial", false);
+}
+
+//+------------------------------------------------------------------+
+//| Create Cost Recovery section                                      |
+//+------------------------------------------------------------------+
+void CreateCostRecoverySection(int y)
+{
+   string name = dashboardPrefix + "CostRecovery";
+   
+   // Create header background
+   ObjectCreate(0, name + "_HeaderBG", OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, name + "_HeaderBG", OBJPROP_XDISTANCE, 10);
+   ObjectSetInteger(0, name + "_HeaderBG", OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, name + "_HeaderBG", OBJPROP_XSIZE, 500);
+   ObjectSetInteger(0, name + "_HeaderBG", OBJPROP_YSIZE, 25);
+   ObjectSetInteger(0, name + "_HeaderBG", OBJPROP_BGCOLOR, costRecoveryHeaderBg);
+   ObjectSetInteger(0, name + "_HeaderBG", OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, name + "_HeaderBG", OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name + "_HeaderBG", OBJPROP_STYLE, STYLE_SOLID);
+   ObjectSetInteger(0, name + "_HeaderBG", OBJPROP_WIDTH, 1);
+   ObjectSetInteger(0, name + "_HeaderBG", OBJPROP_BACK, false);
+   ObjectSetInteger(0, name + "_HeaderBG", OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name + "_HeaderBG", OBJPROP_SELECTED, false);
+   ObjectSetInteger(0, name + "_HeaderBG", OBJPROP_HIDDEN, true);
+   ObjectSetInteger(0, name + "_HeaderBG", OBJPROP_ZORDER, 2);
+   
+   // Create header label
+   CreateLabel(name + "_Header", "Cost Recovery Estimate", 250, y + 13, clrBlack, 10, "Arial Bold", true);
+   
+   y += 25;
+   
+   // Create criteria background
+   ObjectCreate(0, name + "_CriteriaBG", OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, name + "_CriteriaBG", OBJPROP_XDISTANCE, 10);
+   ObjectSetInteger(0, name + "_CriteriaBG", OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, name + "_CriteriaBG", OBJPROP_XSIZE, 500);
+   ObjectSetInteger(0, name + "_CriteriaBG", OBJPROP_YSIZE, 20);
+   ObjectSetInteger(0, name + "_CriteriaBG", OBJPROP_BGCOLOR, costRecoveryCriteriaBg);
+   ObjectSetInteger(0, name + "_CriteriaBG", OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, name + "_CriteriaBG", OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name + "_CriteriaBG", OBJPROP_STYLE, STYLE_SOLID);
+   ObjectSetInteger(0, name + "_CriteriaBG", OBJPROP_WIDTH, 1);
+   ObjectSetInteger(0, name + "_CriteriaBG", OBJPROP_BACK, false);
+   ObjectSetInteger(0, name + "_CriteriaBG", OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name + "_CriteriaBG", OBJPROP_SELECTED, false);
+   ObjectSetInteger(0, name + "_CriteriaBG", OBJPROP_HIDDEN, true);
+   ObjectSetInteger(0, name + "_CriteriaBG", OBJPROP_ZORDER, 2);
+   
+   // Create criteria labels - improved alignment
+   CreateLabel(name + "_Criteria", "Criteria", 20, y + 10, textColor, 9);
+   CreateLabel(name + "_Loss_Header", "Loss on Prop", 200, y + 10, textColor, 9);
+   CreateLabel(name + "_Profit_Header", "Profit on Real", 350, y + 10, textColor, 9);
+   CreateLabel(name + "_Recovery_Header", "Recovery", 450, y + 10, textColor, 9);
+   
+   y += 20;
+   
+   // Create Max DD row
+   CreateLabel(name + "_MaxDD", "Max DD", 20, y + 10, textColor, 9);
+   CreateLabel(name + "_Loss_Prop", "0.00", 200, y + 10, textColor, 9);
+   CreateLabel(name + "_Profit_Real", "0.00", 350, y + 10, textColor, 9);
+   CreateLabel(name + "_Recovery", "0.0 %", 450, y + 10, textColor, 9);
+}
+
+//+------------------------------------------------------------------+
+//| Delete dashboard                                                  |
+//+------------------------------------------------------------------+
+void DeleteDashboard()
+{
+   ObjectsDeleteAll(0, dashboardPrefix);
+}
+
+//+------------------------------------------------------------------+
+//| Create a text label                                               |
+//+------------------------------------------------------------------+
+void CreateLabel(string name, string text, int x, int y, color clr, int fontSize, 
+                string font = "Arial", bool centered = false)
+{
+   ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+   ObjectSetString(0, name, OBJPROP_TEXT, text);
+   ObjectSetString(0, name, OBJPROP_FONT, font);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, fontSize);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
+   ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_ANCHOR, centered ? ANCHOR_CENTER : ANCHOR_LEFT);
+}
+
+//+------------------------------------------------------------------+
+//| UTILITY FUNCTIONS                                                 |
+//+------------------------------------------------------------------+
+bool IsNewBar()
+{
+   static datetime last_time = 0;
+   datetime current_time = iTime(_Symbol, PERIOD_CURRENT, 0);
+   if(last_time == current_time) return false;
+   last_time = current_time;
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Check if bar is confirmed (not still forming)                    |
+//+------------------------------------------------------------------+
+// used by IsConfirmedBar()
+bool IsConfirmedBar()
+{
+   return  ( TimeCurrent() - TimeSeries[0] ) >= PeriodSeconds();
+}
+//+------------------------------------------------------------------+
+//| Check if market is open                                          |
+//+------------------------------------------------------------------+
+bool IsMarketOpen()
+{
+   // For Forex, we can check if trading is allowed
+   return SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE) != SYMBOL_TRADE_MODE_DISABLED;
+}
+   
+//+------------------------------------------------------------------+
+//| Check if we have an open position                                |
+//+------------------------------------------------------------------+
+bool HasOpenPosition()
+{
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket)
+      {
+         if(PositionGetString(POSITION_SYMBOL) == _Symbol && 
+            PositionGetInteger(POSITION_MAGIC) == Magic_Number)
          {
-            // Swap: Use main TP as hedge SL, main SL as hedge TP
-            adjustedSL = tp;  // Main TP becomes hedge SL (below price)
-            adjustedTP = sl;  // Main SL becomes hedge TP (above price)
-            Print("🔄 HEDGE BUY: Swapped SL/TP");
-            Print("   Adjusted SL: ", DoubleToString(adjustedSL, 5), " (was TP)");
-            Print("   Adjusted TP: ", DoubleToString(adjustedTP, 5), " (was SL)");
+            return true;
          }
       }
    }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate position size based on risk                            |
+//+------------------------------------------------------------------+
+double CalculatePositionSize(double slPips, double riskPercent)
+{
+   // Add validation and logging
+   if(slPips <= 0) {
+      Print("ERROR: Invalid stop loss distance of ", slPips, " pips. Using minimum lot.");
+      return MinLot;
+   }
+   
+   double accountBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   
+   // Calculate risk amount based on percentage
+   double riskAmount = accountBalance * riskPercent / 100;
+   
+   // Calculate pip value with validation
+   double pipValue = 0;
+   if(tickSize > 0) {
+      pipValue = tickValue * (GetPipSize() / tickSize);
+   } else {
+      Print("ERROR: Tick size is zero. Using minimum lot.");
+      return MinLot;
+   }
+   
+   if(pipValue <= 0) {
+      Print("ERROR: Invalid pip value. Using minimum lot.");
+      return MinLot;
+   }
+   
+   // Calculate lot size with validation
+   double lotSize = riskAmount / (slPips * pipValue);
+   
+   // Log the calculation for debugging
+   Print("Risk calculation: Balance=", accountBalance, 
+         ", Risk%=", riskPercent, 
+         ", SL pips=", slPips, 
+         ", Pip value=", pipValue,
+         ", Risk amount=", riskAmount, 
+         ", Calculated lot=", lotSize);
+   
+   // Apply maximum risk limit (10% of balance)
+   return MathMax(MinLot, MathMin(lotSize, accountBalance * 0.1));
+}
+
+//+------------------------------------------------------------------+
+//| Get pip size for current symbol                                  |
+//+------------------------------------------------------------------+
+double GetPipSize()
+{
+   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   
+   // For Forex
+   if(digits == 3 || digits == 5) return (10 * tickSize);
+   
+   // For other instruments
+   return tickSize;
+}
+
+//+------------------------------------------------------------------+
+//| Normalize lot size to broker's requirements                      |
+//+------------------------------------------------------------------+
+double NormalizeLots(double lots)
+{
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   
+   lots = MathMax(lots, minLot);
+   lots = MathMin(lots, maxLot);
+   lots = MathRound(lots / lotStep) * lotStep;
+   
+   return lots;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate total volume of open positions                          |
+//+------------------------------------------------------------------+
+double CalculateTotalVolume()
+{
+   double volume = 0;
+   
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket)
+      {
+         // Check if position belongs to this EA
+         if(PositionGetInteger(POSITION_MAGIC) == Magic_Number)
+         {
+            volume += PositionGetDouble(POSITION_VOLUME);
+         }
+      }
+   }
+   
+   return volume;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate daily PnL                                              |
+//+------------------------------------------------------------------+
+double CalculateDailyPnL()
+{
+   // Return current open profit for basic implementation
+   static double dayStartEquity = 0;
+   static datetime lastDay = 0;
+   
+   datetime currentTime = TimeCurrent();
+   MqlDateTime dt;
+   TimeToStruct(currentTime, dt);
+   
+   // New day check
+   if(lastDay != dt.day)
+   {
+      dayStartEquity = AccountInfoDouble(ACCOUNT_BALANCE);
+      lastDay = dt.day;
+   }
+   
+   return AccountInfoDouble(ACCOUNT_EQUITY) - dayStartEquity;
+}
+
+//+------------------------------------------------------------------+
+//| Send hedge signal to hedge EA                                     |
+//+------------------------------------------------------------------+
+
+void SendHedgeSignal(string signalType, string direction, double volume, double tp, double sl)
+{
+   if(!EnableHedgeCommunication) return;
    
    if(CommunicationMethod == GLOBAL_VARS)
    {
@@ -379,160 +2146,107 @@ void SendHedgeSignal(string signalType, string direction, double volume, double 
       GlobalVariableSet("EASignal_Type_" + magicStr, (double)StringGetTickCount(signalType));
       GlobalVariableSet("EASignal_Direction_" + magicStr, (double)StringGetTickCount(direction));
       GlobalVariableSet("EASignal_Volume_" + magicStr, volume);
-      GlobalVariableSet("EASignal_SL_" + magicStr, adjustedSL);
-      GlobalVariableSet("EASignal_TP_" + magicStr, adjustedTP);
+      GlobalVariableSet("EASignal_SL_" + magicStr, sl);
+      GlobalVariableSet("EASignal_TP_" + magicStr, tp);
       GlobalVariableSet("EASignal_Time_" + magicStr, (double)TimeCurrent());
       
-      Print("✅ Signal sent via GLOBAL_VARS: ", signalType, " ", direction, " ", 
-            DoubleToString(volume, 2), " lots, TP: ", DoubleToString(adjustedTP, 5), 
-            ", SL: ", DoubleToString(adjustedSL, 5));
+      Print("Signal sent to hedge EA: ", signalType, " ", direction, " ", 
+            DoubleToString(volume, 2), " lots, TP: ", DoubleToString(tp, 5), 
+            ", SL: ", DoubleToString(sl, 5));
    }
    else // FILE_BASED
    {
-      // Create a signal string with ADJUSTED parameters
+      // Create a signal string with all parameters
       string signalData = signalType + "," + 
                         direction + "," + 
                         DoubleToString(volume, 2) + "," + 
-                        DoubleToString(adjustedTP, 5) + "," + 
-                        DoubleToString(adjustedSL, 5) + "," + 
+                        DoubleToString(tp, 5) + "," + 
+                        DoubleToString(sl, 5) + "," + 
                         IntegerToString(Magic_Number) + "," +
                         IntegerToString(TimeCurrent());
       
-      Print("📤 SENDING FILE SIGNAL: ", signalData);
-      Print("   File path: ", COMM_FILE_PATH);
-      
-      // Force close any potentially open handles first
-      CleanupFileHandles();
+      Print("SENDING SIGNAL: ", signalData);  // Debug signal transmission
       
       // Try to write the signal file with retries
       bool success = false;
       for(int attempt = 1; attempt <= FILE_WRITE_RETRY && !success; attempt++)
       {
-         Print("   Attempt ", attempt, " of ", FILE_WRITE_RETRY);
-         
-         // Reset last error before attempting
-         ResetLastError();
-         
-         int fileHandle = INVALID_HANDLE;
-         
-         // Use appropriate flags based on which path we're using
-         bool useFileCommon = (StringFind(COMM_FILE_PATH, "Common") >= 0);
-         fileHandle = useFileCommon ? 
-                     FileOpen(COMM_FILE_PATH, FILE_WRITE|FILE_TXT|FILE_COMMON) :
-                     FileOpen(COMM_FILE_PATH, FILE_WRITE|FILE_TXT);
-         
+         int fileHandle = FileOpen(COMM_FILE_PATH, FILE_WRITE|FILE_TXT|FILE_COMMON);
          if(fileHandle != INVALID_HANDLE)
          {
-            // Successfully opened file
-            int writeResult = FileWriteString(fileHandle, signalData);
-            FileFlush(fileHandle);  // Force write to disk
-            FileClose(fileHandle);  // Always close immediately
-            fileHandle = INVALID_HANDLE; // Mark as closed
+            FileWriteString(fileHandle, signalData);
+            FileClose(fileHandle);
+            success = true;
             
-            if(writeResult > 0)
-            {
-               success = true;
-               Print("✅ Signal sent to hedge EA via file successfully!");
-               Print("   Signal: ", signalType, " ", direction, " ", DoubleToString(volume, 2), " lots");
-               Print("   Adjusted TP: ", DoubleToString(adjustedTP, 5), " SL: ", DoubleToString(adjustedSL, 5));
-               Print("   Bytes written: ", writeResult);
-            }
-            else
-            {
-               int writeError = GetLastError();
-               Print("❌ File write failed. Error: ", writeError, " (", GetErrorDescription(writeError), ")");
-            }
+            Print("Signal sent to hedge EA via file: ", signalType, " ", direction, " ", 
+                  DoubleToString(volume, 2), " lots");
          }
          else
          {
             int errorCode = GetLastError();
-            Print("❌ File open attempt ", attempt, " failed. Error: ", errorCode, " (", GetErrorDescription(errorCode), ")");
-            Print("   Path: ", COMM_FILE_PATH);
+            Print("ERROR (attempt ", attempt, "): Failed to write signal file: ", errorCode);
             
-            if(attempt < FILE_WRITE_RETRY)
-            {
-               Print("   Waiting 200ms before retry...");
-               Sleep(200); // Increased wait time
-               CleanupFileHandles(); // Clean up before retry
-            }
+            // Wait briefly before retry
+            Sleep(100);
          }
       }
       
       if(!success)
       {
-         Print("💥 CRITICAL ERROR: Failed to send signal to hedge EA after ", 
+         Print("CRITICAL ERROR: Failed to send signal to hedge EA after ", 
                IntegerToString(FILE_WRITE_RETRY), " attempts!");
-         Print("   Signal data: ", signalData);
-         Print("   File path: ", COMM_FILE_PATH);
-         
-         // Try alternative method as last resort
-         TryAlternativeSignalMethod(signalData);
       }
    }
 }
 
-// -----------------------------------------------------------------
-// Stub implementations for missing helper functions
-// -----------------------------------------------------------------
-
-bool IsNewBar()
+//+------------------------------------------------------------------+
+//| Send hedge bleed signal                                           |
+//+------------------------------------------------------------------+
+void SendHedgeBleedSignal()
 {
-   static datetime lastBar = 0;
-   datetime cur = iTime(_Symbol, PERIOD_CURRENT, 0);
-   if(cur!=lastBar){ lastBar=cur; return true; }
-   return false;
+   // Calculate bleed amount (50% of the hedge)
+   double bleedVolume = hedgeLotsLast * 0.5;
+   
+   // Get current position type
+   string direction = "BUY";
+   if(PositionSelect(_Symbol))
+   {
+      ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      if(posType == POSITION_TYPE_BUY)
+         direction = "SELL";
+   }
+   
+   // Send the signal
+   SendHedgeSignal("BLEED", direction, bleedVolume, 0, 0);
 }
 
-bool IsInTradingSession()
+//+------------------------------------------------------------------+
+//| Convert uninit reason to text                                     |
+//+------------------------------------------------------------------+
+string GetUninitReasonText(int reason)
 {
-   return true;
+   switch(reason)
+   {
+      case REASON_PROGRAM:     return "Program called uninit";
+      case REASON_REMOVE:      return "Expert removed from chart";
+      case REASON_RECOMPILE:   return "Expert recompiled";
+      case REASON_CHARTCHANGE: return "Symbol or timeframe changed";
+      case REASON_CHARTCLOSE:  return "Chart closed";
+      case REASON_PARAMETERS:  return "Parameters changed";
+      case REASON_ACCOUNT:     return "Another account activated";
+      default:                 return "Unknown reason: " + IntegerToString(reason);
+   }
 }
 
-bool HasOpenPosition()
+//+------------------------------------------------------------------+
+//| Get tick count from a string (hash function)                      |
+//+------------------------------------------------------------------+
+ulong StringGetTickCount(string text)
 {
-   return false;
+   ulong result = 0;
+   for(int i = 0; i < StringLen(text); i++)
+   {
+      result += (ulong)StringGetCharacter(text, i);
+   }
+   return result;
 }
-
-void UpdateDashboard(){}
-
-void DrawPivotLines(){}
-
-void DrawDetectedPivotLines(){ DrawPivotLines(); }
-
-void ShowMarketBiasIndicator(){}
-
-void ManageOpenPositions(){}
-
-void OpenTrade(bool isBuy,double sl,double tp)
-{
-   Print("[Stub] OpenTrade called: ", isBuy ? "BUY" : "SELL", " SL:", sl, " TP:", tp);
-}
-
-void TryAlternativeSignalMethod(string data)
-{
-   Print("[Stub] TryAlternativeSignalMethod: ", data);
-}
-
-string GetErrorDescription(int code)
-{
-   return IntegerToString(code);
-}
-
-double FindDeepestPivotLowBelowClose(int lookbackBars)
-{
-   return 0.0;
-}
-
-double FindHighestPivotHighAboveClose(int lookbackBars)
-{
-   return 0.0;
-}
-
-void CalculateSynergyScore(){}
-
-void CalculateMarketBias(){}
-
-void CalculateADXFilter(){}
-
-void CheckBleedCondition(){}
-
