@@ -52,6 +52,11 @@ input double    MinimumLot            = 0.01;
 const int HEARTBEAT_SEC    = 5;
 const int LINK_TIMEOUT_SEC = 15;
 
+bool mainEALinkRequired = true;        // Hedge EA always requires main EA link
+bool mainEALinkEstablished = false;    // Status of main EA connection
+datetime lastMainEACheck = 0;          // Last time we checked main EA
+bool hedgeReadyForTrading = false;     // Overall trading readiness status
+
 ulong lastPulseSent   = 0;   // when we last pinged
 bool  linkWasOK       = false;
 
@@ -277,9 +282,19 @@ bool IsLinkAlive()
 //────────────────────────────────────────────────────────────────────
 // 6. INIT / DEINIT
 //────────────────────────────────────────────────────────────────────
+//+------------------------------------------------------------------+
+//| Enhanced OnInit for Hedge EA with Link Verification              |
+//+------------------------------------------------------------------+
+
+// Add these global variables to your Hedge EA
+bool mainEALinkRequired = true;        // Hedge EA always requires main EA link
+bool mainEALinkEstablished = false;    // Status of main EA connection
+datetime lastMainEACheck = 0;          // Last time we checked main EA
+bool hedgeReadyForTrading = false;     // Overall trading readiness status
+
 int OnInit()
 {
-   Print("===== HEDGE EA STARTUP v2.05 =====");
+   Print("===== HEDGE EA STARTUP v2.06 =====");
    Print("Magic_Number: ", Magic_Number);
    Print("SourceEA_Magic: ", SourceEA_Magic);
    Print("CommunicationMethod: ", CommunicationMethod == GLOBAL_VARS ? "GLOBAL_VARS" : "FILE_BASED");
@@ -288,10 +303,21 @@ int OnInit()
    
    trade.SetExpertMagicNumber(Magic_Number);
    initialBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   
+   // Initialize link status
+   mainEALinkEstablished = false;
+   hedgeReadyForTrading = false;
+   
+   Print("=== HEDGE LINK REQUIREMENTS ===");
+   Print("🔗 Main EA connection is REQUIRED for hedge operations");
+   Print("   Hedge EA will NOT process signals until main EA link is established");
+   Print("   Target Main EA Magic: ", SourceEA_Magic);
+   
    CreateDashboard();
    
    if(CommunicationMethod == GLOBAL_VARS)
    {
+      Print("=== GLOBAL VARIABLES SETUP ===");
       // CRITICAL: Register our heartbeat and check if it worked
       string heartbeatName = "HEDGE_HB_" + IntegerToString(Magic_Number);
       GlobalVariableSet(heartbeatName, (double)TimeCurrent());
@@ -299,19 +325,19 @@ int OnInit()
       // Verify the heartbeat was set
       if(GlobalVariableCheck(heartbeatName)) {
          double checkValue = GlobalVariableGet(heartbeatName);
-         LogImportant("HEDGE HEARTBEAT VERIFIED: Variable " + heartbeatName + " = " + TimeToString((datetime)checkValue));
+         LogImportant("✅ HEDGE HEARTBEAT VERIFIED: Variable " + heartbeatName + " = " + TimeToString((datetime)checkValue));
       } else {
-         LogError("Failed to set hedge heartbeat global variable: " + heartbeatName);
+         LogError("❌ Failed to set hedge heartbeat global variable: " + heartbeatName);
       }
       
       // Check if we can find the main EA's heartbeat
       string mainHeartbeat = "PROP_HB_" + IntegerToString(SourceEA_Magic);
       if(GlobalVariableCheck(mainHeartbeat)) {
          double mainValue = GlobalVariableGet(mainHeartbeat);
-         LogImportant("MAIN EA HEARTBEAT FOUND: " + mainHeartbeat + " = " + TimeToString((datetime)mainValue));
+         LogImportant("✅ MAIN EA HEARTBEAT FOUND: " + mainHeartbeat + " = " + TimeToString((datetime)mainValue));
       } else {
-         LogError("Main EA heartbeat not found: " + mainHeartbeat);
-         LogError("Is the Main EA running? Is its Magic Number set correctly to " + IntegerToString(SourceEA_Magic) + "?");
+         LogError("❌ Main EA heartbeat not found: " + mainHeartbeat);
+         LogError("   Is the Main EA running? Is its Magic Number set correctly to " + IntegerToString(SourceEA_Magic) + "?");
       }
       
       // Only dump variables in verbose mode
@@ -327,6 +353,7 @@ int OnInit()
    }
    else // FILE_BASED mode
    {
+      Print("=== FILE COMMUNICATION SETUP ===");
       LogImportant("File-based communication paths:");
       LogImportant("- Hedge heartbeat: " + HEARTBEAT_FILE_PATH);
       LogImportant("- Main heartbeat: " + MAIN_HEARTBEAT_FILE_PATH);
@@ -339,27 +366,46 @@ int OnInit()
          FileWriteString(fileHandle, "HEDGE_HEARTBEAT," + IntegerToString(Magic_Number) + "," + 
                         IntegerToString(TimeCurrent()));
          FileClose(fileHandle);
-         LogImportant("File-based hedge communication initialized. Magic: " + IntegerToString(Magic_Number));
+         LogImportant("✅ File-based hedge communication initialized. Magic: " + IntegerToString(Magic_Number));
       }
       else
       {
          int errorCode = GetLastError();
-         LogError("Failed to create heartbeat file: " + IntegerToString(errorCode) + " - " + 
+         LogError("❌ Failed to create heartbeat file: " + IntegerToString(errorCode) + " - " + 
                (errorCode == 5002 ? "Cannot create file (permissions?)" :
                 errorCode == 4103 ? "Invalid path" : "File error"));
-         LogError("File path attempted: " + HEARTBEAT_FILE_PATH);
-         LogWarning("EA will continue but file communication may not work properly");
+         LogError("   File path attempted: " + HEARTBEAT_FILE_PATH);
+         LogWarning("   EA will continue but file communication may not work properly");
       }
    }
    
    // Start heartbeat timer
    EventSetTimer(2); // Check every 2 seconds initially
    SendHeartbeat();
-   linkWasOK = IsLinkAlive();
-   Print("PropEA Hedge initialized. Link ", linkWasOK ? "OK ✅" : "NOT OK ❌");
+   
+   // Perform initial link check
+   Print("=== INITIAL MAIN EA LINK CHECK ===");
+   PerformInitialMainEALinkCheck();
+   
+   Print("=== HEDGE EA STATUS ===");
+   Print("Main EA Link Required: ", mainEALinkRequired ? "TRUE" : "FALSE");
+   Print("Main EA Link Established: ", mainEALinkEstablished ? "TRUE" : "FALSE");
+   Print("Hedge Ready for Trading: ", hedgeReadyForTrading ? "TRUE" : "FALSE");
+   
+   if(mainEALinkEstablished)
+   {
+      Print("✅ HEDGE EA READY: Can process signals from Main EA");
+   }
+   else
+   {
+      Print("🚫 HEDGE EA WAITING: No signals will be processed until Main EA connects");
+   }
+   
+   Print("PropEA Hedge initialized. Link ", mainEALinkEstablished ? "ESTABLISHED ✅" : "WAITING ❌");
    
    return(INIT_SUCCEEDED);
 }
+
 
 void OnDeinit(const int reason)
 {
@@ -385,9 +431,44 @@ void OnDeinit(const int reason)
    Print("PropEA Hedge stopped. Reason: ", reason);
 }
 
-//────────────────────────────────────────────────────────────────────
-// 7. TIMER – pulse & link monitor
-//────────────────────────────────────────────────────────────────────
+//+------------------------------------------------------------------+
+//| Perform initial main EA link check during initialization         |
+//+------------------------------------------------------------------+
+void PerformInitialMainEALinkCheck()
+{
+   Print("Checking for Main EA connection...");
+   
+   // Give some time for Main EA to initialize if starting together
+   Sleep(2000); // Wait 2 seconds
+   
+   bool linkStatus = IsLinkAlive();
+   mainEALinkEstablished = linkStatus;
+   hedgeReadyForTrading = linkStatus;
+   linkWasOK = linkStatus;
+   lastMainEACheck = TimeCurrent();
+   
+   if(mainEALinkEstablished)
+   {
+      Print("🔗 MAIN EA LINK ESTABLISHED!");
+      Print("   ✅ Connection confirmed with Main EA (Magic: ", SourceEA_Magic, ")");
+      Print("   ✅ Hedge EA is now READY to process signals");
+   }
+   else
+   {
+      Print("🔗 MAIN EA LINK NOT FOUND");
+      Print("   ❌ No connection with Main EA (Magic: ", SourceEA_Magic, ")");
+      Print("   🚫 Signal processing is BLOCKED until connection established");
+      Print("   📋 To enable hedge operations:");
+      Print("      1. Start Main EA with Magic Number ", SourceEA_Magic);
+      Print("      2. Ensure same communication method (", CommunicationMethod == GLOBAL_VARS ? "GLOBAL_VARS" : "FILE_BASED", ")");
+      Print("      3. Check that both EAs can access communication files/variables");
+   }
+}
+
+
+//+------------------------------------------------------------------+
+//| Enhanced OnTimer with main EA link monitoring                    |
+//+------------------------------------------------------------------+
 void OnTimer()
 {
    timerCount++;
@@ -421,29 +502,96 @@ void OnTimer()
       LogInfo("Switching to normal heartbeat interval of " + IntegerToString(HEARTBEAT_SEC) + " seconds");
    }
    
-   // Check link status - only log changes
-   bool ok = IsLinkAlive();
-   if(ok != linkWasOK) {
-      LogImportant("Main EA link is now " + (ok ? "OK ✅" : "NOT OK ❌"));
+   // Check link status and update hedge readiness
+   bool currentLinkStatus = IsLinkAlive();
+   
+   // Update main EA link status
+   bool statusChanged = (currentLinkStatus != mainEALinkEstablished);
+   mainEALinkEstablished = currentLinkStatus;
+   hedgeReadyForTrading = currentLinkStatus;
+   
+   if(statusChanged)
+   {
+      if(mainEALinkEstablished)
+      {
+         Print("🔗 MAIN EA LINK ESTABLISHED! Hedge operations now ENABLED ✅");
+      }
+      else
+      {
+         Print("🔗 MAIN EA LINK LOST! Hedge operations now BLOCKED 🚫");
+         Print("   Reconnect Main EA (Magic: ", SourceEA_Magic, ") to resume hedge operations");
+      }
+   }
+   
+   // Log status changes
+   if(currentLinkStatus != linkWasOK)
+   {
+      Print("Main EA link status changed: ", currentLinkStatus ? "CONNECTED ✅" : "DISCONNECTED ❌");
       
-      // Only dump variables in verbose mode and on link changes
-      if(CommunicationMethod == GLOBAL_VARS && LogVerbosity >= LOG_VERBOSE) {
-         Print("--- GLOBAL VARIABLES AT LINK STATUS CHANGE ---");
-         for(int i=0; i<GlobalVariablesTotal(); i++) {
-            string name = GlobalVariableName(i);
-            double value = GlobalVariableGet(name);
-            Print(i, ": ", name, " = ", value, " (time: ", TimeToString((datetime)value), ")");
+      // When link fails, print diagnostics
+      if(!currentLinkStatus) 
+      {
+         Print("--- MAIN EA LINK DIAGNOSTICS ---");
+         Print("Communication Method: ", CommunicationMethod == GLOBAL_VARS ? "GLOBAL_VARS" : "FILE_BASED");
+         Print("Target Magic Number: ", SourceEA_Magic);
+         Print("Our Magic Number: ", Magic_Number);
+         
+         if(CommunicationMethod == GLOBAL_VARS)
+         {
+            Print("Expected Global Variable: PROP_HB_", SourceEA_Magic);
+            Print("Current Global Variables:");
+            for(int i=0; i<GlobalVariablesTotal(); i++) 
+            {
+               string name = GlobalVariableName(i);
+               double value = GlobalVariableGet(name);
+               Print("  ", name, " = ", value);
+            }
          }
-         Print("--------------------------------------");
+         else
+         {
+            Print("Expected File: ", MAIN_HEARTBEAT_FILE_PATH);
+            Print("File Exists: ", FileIsExist(MAIN_HEARTBEAT_FILE_PATH, FILE_COMMON) ? "YES" : "NO");
+         }
+         Print("-----------------------------");
       }
       
-      linkWasOK = ok;
+      linkWasOK = currentLinkStatus;
    }
+   
+   lastMainEACheck = TimeCurrent();
 }
 
-//────────────────────────────────────────────────────────────────────
-// 8. ONTICK MAIN LOOP
-//────────────────────────────────────────────────────────────────────
+//+------------------------------------------------------------------+
+//| Check if hedge operations are allowed                            |
+//+------------------------------------------------------------------+
+bool IsHedgeOperationAllowed()
+{
+   // Basic trading enabled check
+   if(!EnableTrading)
+   {
+      return false;
+   }
+   
+   // Main EA link requirement check
+   if(mainEALinkRequired && !mainEALinkEstablished)
+   {
+      // Periodically remind about blocked status
+      static datetime lastReminder = 0;
+      if(TimeCurrent() - lastReminder > 60) // Every minute
+      {
+         Print("⏳ Hedge operations blocked: Waiting for Main EA link (Magic: ", SourceEA_Magic, ")");
+         lastReminder = TimeCurrent();
+      }
+      return false;
+   }
+   
+   return true;
+}
+
+
+//+------------------------------------------------------------------+
+//| Enhanced OnTick with link verification                           |
+//+------------------------------------------------------------------+
 void OnTick()
 {
    if(!EnableTrading) return;
@@ -471,7 +619,19 @@ void OnTick()
       lastTickLog = TimeCurrent();
    }
 
-   // Only process hedge traffic if link alive
+   // CRITICAL: Only process hedge signals if operations are allowed
+   if(!IsHedgeOperationAllowed())
+   {
+      static datetime lastBlockWarning = 0;
+      if(TimeCurrent() - lastBlockWarning > 300) // Every 5 minutes
+      {
+         LogWarning("Hedge operations blocked: Main EA link not established");
+         lastBlockWarning = TimeCurrent();
+      }
+      return;
+   }
+
+   // Only process hedge traffic if link alive (double check)
    bool linkStatus = IsLinkAlive();
    if(!linkStatus) {
       static datetime lastLinkWarning = 0;
@@ -486,14 +646,24 @@ void OnTick()
    ManageHedgePositions();
 }
 
+
 //────────────────────────────────────────────────────────────────────
 // 9. COMMUNICATION LAYER (read signals)
 //────────────────────────────────────────────────────────────────────
 
 void ProcessSignal(string signalType,string direction,double volume,double tp,double sl); // fwd decl
 
+//+------------------------------------------------------------------+
+//| Enhanced CheckForHedgeSignals with link verification             |
+//+------------------------------------------------------------------+
 void CheckForHedgeSignals()
 {
+   // Additional safety check
+   if(!IsHedgeOperationAllowed())
+   {
+      return;
+   }
+   
    if(CommunicationMethod == GLOBAL_VARS)
    {
       string base = IntegerToString(SourceEA_Magic);
@@ -532,7 +702,7 @@ void CheckForHedgeSignals()
       else LogWarning("Unknown direction code: " + IntegerToString(dirCode));
 
       if(sType != "" && dir != "") {
-         LogImportant("Signal received: " + sType + " " + dir + " " + DoubleToString(vol, 2) + 
+         LogImportant("Signal received from Main EA: " + sType + " " + dir + " " + DoubleToString(vol, 2) + 
                " lots, TP: " + DoubleToString(tp, 5) + ", SL: " + DoubleToString(sl, 5));
          ProcessSignal(sType, dir, vol, tp, sl);
       } else {
@@ -596,13 +766,14 @@ void CheckForHedgeSignals()
          return;
       }
       
-      LogImportant("Signal received: " + signalType + " " + direction + " " + 
+      LogImportant("Signal received from Main EA: " + signalType + " " + direction + " " + 
             DoubleToString(volume, 2) + " lots, TP: " + DoubleToString(tp, 5) + 
             ", SL: " + DoubleToString(sl, 5));
       
       ProcessSignal(signalType, direction, volume, tp, sl);
    }
 }
+
 
 //────────────────────────────────────────────────────────────────────
 // 10. EXECUTE/UPDATE/CLOSE TRADES
@@ -921,6 +1092,9 @@ void CreateLabel(string name,string txt,int x,int y,color c){
    ObjectSetInteger(0,name,OBJPROP_CORNER,CORNER_LEFT_UPPER);
 }
 
+//+------------------------------------------------------------------+
+//| Enhanced Dashboard with hedge status                             |
+//+------------------------------------------------------------------+
 void CreateDashboard()
 {
    DeleteDashboard();
@@ -928,43 +1102,68 @@ void CreateDashboard()
    ObjectSetInteger(0,dash+"bg",OBJPROP_XDISTANCE,20);
    ObjectSetInteger(0,dash+"bg",OBJPROP_YDISTANCE,20);
    ObjectSetInteger(0,dash+"bg",OBJPROP_XSIZE,260);
-   ObjectSetInteger(0,dash+"bg",OBJPROP_YSIZE,220); // Increased height for log level display
+   ObjectSetInteger(0,dash+"bg",OBJPROP_YSIZE,240); // Increased height for new status
    ObjectSetInteger(0,dash+"bg",OBJPROP_BGCOLOR,clrNavy);
    ObjectSetInteger(0,dash+"bg",OBJPROP_STYLE,STYLE_SOLID);
    ObjectSetInteger(0,dash+"bg",OBJPROP_HIDDEN,true);
 
-   CreateLabel(dash+"title","PropEA Hedge v2.05", 150,35, clrGold);
-   CreateLabel(dash+"commL","Comm",  40,70, clrWhite);
-   CreateLabel(dash+"commV",CommunicationMethod == GLOBAL_VARS ? "Global" : "Files", 120,70, clrYellow);
-   CreateLabel(dash+"linkL","Link",   40,90, clrWhite);
-   CreateLabel(dash+"linkV","--",    120,90, clrRed);
-   CreateLabel(dash+"bleedL","Bleed", 40,110, clrWhite);
-   CreateLabel(dash+"bleedV","Pending",120,110, clrRed);
-   CreateLabel(dash+"logL","Log Level", 40,130, clrWhite);
+   CreateLabel(dash+"title","PropEA Hedge v2.06", 150,35, clrGold);
+   CreateLabel(dash+"commL","Comm",  40,60, clrWhite);
+   CreateLabel(dash+"commV",CommunicationMethod == GLOBAL_VARS ? "Global" : "Files", 120,60, clrYellow);
+   CreateLabel(dash+"linkL","Main EA Link",   40,80, clrWhite);
+   CreateLabel(dash+"linkV","--",    120,80, clrRed);
+   CreateLabel(dash+"statusL","Hedge Status", 40,100, clrWhite);
+   CreateLabel(dash+"statusV","WAITING", 120,100, clrRed);
+   CreateLabel(dash+"bleedL","Bleed", 40,120, clrWhite);
+   CreateLabel(dash+"bleedV","Pending",120,120, clrRed);
+   CreateLabel(dash+"logL","Log Level", 40,140, clrWhite);
    CreateLabel(dash+"logV",LogVerbosity == LOG_ERRORS_ONLY ? "Errors" : 
-                          LogVerbosity == LOG_IMPORTANT ? "Important" : "Verbose", 120,130, clrCyan);
+                          LogVerbosity == LOG_IMPORTANT ? "Important" : "Verbose", 120,140, clrCyan);
    
    // Add diagnostic info to dashboard
-   CreateLabel(dash+"magicL","Magic", 40,150, clrWhite);
-   CreateLabel(dash+"magicV",IntegerToString(Magic_Number),120,150, clrWhite);
-   CreateLabel(dash+"sourceL","Source", 40,170, clrWhite);
-   CreateLabel(dash+"sourceV",IntegerToString(SourceEA_Magic),120,170, clrWhite);
-   CreateLabel(dash+"hbL","Last HB", 40,190, clrWhite);
-   CreateLabel(dash+"hbV","--",120,190, clrWhite);
+   CreateLabel(dash+"magicL","Magic", 40,160, clrWhite);
+   CreateLabel(dash+"magicV",IntegerToString(Magic_Number),120,160, clrWhite);
+   CreateLabel(dash+"sourceL","Source", 40,180, clrWhite);
+   CreateLabel(dash+"sourceV",IntegerToString(SourceEA_Magic),120,180, clrWhite);
+   CreateLabel(dash+"hbL","Last HB", 40,200, clrWhite);
+   CreateLabel(dash+"hbV","--",120,200, clrWhite);
 }
 
 void UpdateDashboard()
 {
-   color okCol = IsLinkAlive()?clrLime:clrRed;
-   string txt  = IsLinkAlive()?"OK":"NOT OK";
-   ObjectSetString (0,dash+"linkV",OBJPROP_TEXT ,txt);
-   ObjectSetInteger(0,dash+"linkV",OBJPROP_COLOR,okCol);
+   // Main EA Link Status
+   color linkCol = mainEALinkEstablished ? clrLime : clrRed;
+   string linkTxt = mainEALinkEstablished ? "CONNECTED" : "WAITING";
+   ObjectSetString (0,dash+"linkV",OBJPROP_TEXT, linkTxt);
+   ObjectSetInteger(0,dash+"linkV",OBJPROP_COLOR, linkCol);
+   
+   // Hedge Status 
+   color statusCol = hedgeReadyForTrading ? clrLime : clrRed;
+   string statusTxt = hedgeReadyForTrading ? "READY" : "BLOCKED";
+   ObjectSetString (0,dash+"statusV",OBJPROP_TEXT, statusTxt);
+   ObjectSetInteger(0,dash+"statusV",OBJPROP_COLOR, statusCol);
 
-   ObjectSetString (0,dash+"bleedV",OBJPROP_TEXT , bleedDone?"Executed":"Pending");
-   ObjectSetInteger(0,dash+"bleedV",OBJPROP_COLOR, bleedDone?clrLime:clrRed);
+   // Bleed Status
+   ObjectSetString (0,dash+"bleedV",OBJPROP_TEXT, bleedDone ? "Executed" : "Pending");
+   ObjectSetInteger(0,dash+"bleedV",OBJPROP_COLOR, bleedDone ? clrLime : clrRed);
    
    // Update heartbeat time
    ObjectSetString(0,dash+"hbV",OBJPROP_TEXT, TimeToString(TimeCurrent(), TIME_SECONDS));
 }
+
+//+------------------------------------------------------------------+
+//| Get hedge status description                                     |
+//+------------------------------------------------------------------+
+string GetHedgeStatusDescription()
+{
+   if(!EnableTrading)
+      return "DISABLED (EnableTrading = false)";
+   
+   if(!mainEALinkEstablished)
+      return "BLOCKED (Waiting for Main EA)";
+   
+   return "READY (Main EA connected)";
+}
+
 
 void DeleteDashboard(){ ObjectsDeleteAll(0,dash); }
