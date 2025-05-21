@@ -254,25 +254,7 @@ double GetActualAccountVolume()
 //+------------------------------------------------------------------+
 double GetLiveAccountFreeMargin()
 {
-   // In a real implementation, this would query the actual live account
-   // For simulation, we'll use a realistic calculation based on hedge positions
-   double propMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
-   double liveMargin = 0;
-   
-   if(EnableHedgeCommunication && IsLinkAlive(true))
-   {
-      // Simulate live account margin based on hedge positions
-      double hedgeVolume = GetActualAccountVolume() * hedgeFactor;
-      double marginPerLot = SymbolInfoDouble(_Symbol, SYMBOL_MARGIN_INITIAL);
-      liveMargin = (initialBalance * hedgeFactor) - (hedgeVolume * marginPerLot);
-   }
-   else
-   {
-      // No connection - show estimated margin
-      liveMargin = propMargin * hedgeFactor;
-   }
-   
-   return MathMax(0, liveMargin);
+   return MathMax(0, hedgeMargin);
 }
 
 //+------------------------------------------------------------------+
