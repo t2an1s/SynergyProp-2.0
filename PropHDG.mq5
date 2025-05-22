@@ -21,6 +21,7 @@
 #property strict
 
 #include <Trade\Trade.mqh>
+#include "SynergyCommon.mqh"
 CTrade trade;
 
 //────────────────────────────────────────────────────────────────────
@@ -48,9 +49,7 @@ input double    MinimumLot            = 0.01;
 // 2. CONSTANTS & GLOBALS
 //────────────────────────────────────────────────────────────────────
 
-// Heart‑beat parameters (same values as prop side)
-const int HEARTBEAT_SEC    = 5;
-const int LINK_TIMEOUT_SEC = 15;
+// Heart‑beat parameters defined in SynergyCommon.mqh
 
 bool mainEALinkRequired = true;        // Hedge EA always requires main EA link
 bool mainEALinkEstablished = false;    // Status of main EA connection
@@ -76,8 +75,6 @@ string COMM_FILE_PATH = "MQL5\\Files\\MT5com.txt";
 string HEARTBEAT_FILE_PATH = "MQL5\\Files\\MT5com_hedge_heartbeat.txt";
 string MAIN_HEARTBEAT_FILE_PATH = "MQL5\\Files\\MT5com_heartbeat.txt";
 string HEDGE_DATA_FILE_PATH = "MQL5\\Files\\HedgeData.txt";
-const int FILE_WRITE_RETRY = 3;   // Number of retries for file operations
-const int FILE_CHECK_SECONDS = 5;  // How often to check for heartbeat
 
 //────────────────────────────────────────────────────────────────────
 // 3. LOGGING HELPERS
@@ -98,14 +95,7 @@ void LogWarning(string message) {
    if(LogVerbosity >= LOG_IMPORTANT) Print("WARNING: ", message);
 }
 
-//────────────────────────────────────────────────────────────────────
-// 4. HELPER – STRING HASH (shared with prop EA)
-//────────────────────────────────────────────────────────────────────
-ulong StringGetTickCount(string text)
-{
-   ulong r=0; for(int i=0;i<StringLen(text);i++) r+=(ulong)StringGetCharacter(text,i);
-   return r;
-}
+
 
 //────────────────────────────────────────────────────────────────────
 // 5. HEART‑BEAT HELPERS
@@ -690,14 +680,14 @@ void CheckForHedgeSignals()
       double tp = GlobalVariableGet("EASignal_TP_" + base);
 
       string sType = "", dir = "";
-      if(typeCode == StringGetTickCount("OPEN")) sType = "OPEN";
-      else if(typeCode == StringGetTickCount("MODIFY")) sType = "MODIFY";
-      else if(typeCode == StringGetTickCount("PARTIAL_CLOSE")) sType = "PARTIAL_CLOSE";
-      else if(typeCode == StringGetTickCount("BLEED")) sType = "BLEED";
+      if(typeCode == StringHash("OPEN")) sType = "OPEN";
+      else if(typeCode == StringHash("MODIFY")) sType = "MODIFY";
+      else if(typeCode == StringHash("PARTIAL_CLOSE")) sType = "PARTIAL_CLOSE";
+      else if(typeCode == StringHash("BLEED")) sType = "BLEED";
       else LogWarning("Unknown signal type code: " + IntegerToString(typeCode));
 
-      if(dirCode == StringGetTickCount("BUY")) dir = "BUY";
-      else if(dirCode == StringGetTickCount("SELL")) dir = "SELL";
+      if(dirCode == StringHash("BUY")) dir = "BUY";
+      else if(dirCode == StringHash("SELL")) dir = "SELL";
       else LogWarning("Unknown direction code: " + IntegerToString(dirCode));
 
       if(sType != "" && dir != "") {
