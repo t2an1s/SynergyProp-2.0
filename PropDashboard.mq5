@@ -3,6 +3,7 @@
 #property strict
 
 #include "PropMain_Dash.mq5"
+#include "SynergyCommon.mqh"
 
 input string PropDataFile = "PropDashData.txt";
 input string HedgeDataFile = "HedgeData.txt";
@@ -40,7 +41,6 @@ double hedgeMargin = 0;
 
 // heartbeat path for link check
 string HEDGE_HEARTBEAT_FILE_PATH;
-const int LINK_TIMEOUT_SEC = 15;
 bool EnableHedgeCommunication = true;
 
 bool ReadPropData()

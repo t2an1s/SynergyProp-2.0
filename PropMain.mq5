@@ -19,6 +19,7 @@
 
 #include <Trade\Trade.mqh>
 #include <Arrays\ArrayObj.mqh>
+#include "SynergyCommon.mqh"
 CTrade trade;
 
 //────────────────────────────────────────────────────────────────────
@@ -46,16 +47,13 @@ bool   beAppliedShort = false;
 bool   entryTriggersEnabled = false;
 bool   inSession            = true;
 // ── Hedge-link monitor ─────────────────────────────────────────────
-const int    HEARTBEAT_SEC    = 5;          // how often we publish our pulse
-const int    LINK_TIMEOUT_SEC = 15;         // grace window before status = NOT OK
+// timing constants moved to SynergyCommon.mqh
 ulong        lastPulseSent    = 0;          // when we last pinged the other side
 bool         linkWasOK        = false;      // remembers previous state for debug prints
 string COMM_FILE_PATH = "MQL5\\Files\\MT5com.txt";
 string HEARTBEAT_FILE_PATH = "MQL5\\Files\\MT5com_heartbeat.txt";
 string HEDGE_HEARTBEAT_FILE_PATH = "MQL5\\Files\\MT5com_hedge_heartbeat.txt";
 string DASH_DATA_FILE_PATH = "MQL5\\Files\\PropDashData.txt";
-const int FILE_WRITE_RETRY = 3;
-const int FILE_CHECK_SECONDS = 5;
 
 
 //--------------------------------------------------------------------
@@ -2048,18 +2046,6 @@ ENUM_TIMEFRAMES GetTimeframeFromString(string tfString)
 //+------------------------------------------------------------------+
 
 //+------------------------------------------------------------------+
-//| Fixed StringGetTickCount function (type conversion fix)           |
-//+------------------------------------------------------------------+
-double StringGetTickCount(string text)
-{
-   ulong result = 0;
-   for(int i = 0; i < StringLen(text); i++)
-   {
-      result += (ulong)StringGetCharacter(text, i);
-   }
-   return (double)result;  // Explicit cast to fix type conversion warning
-}
-//+------------------------------------------------------------------+
 //| UTILITY FUNCTIONS                                                 |
 //+------------------------------------------------------------------+
 bool IsNewBar()
@@ -2191,7 +2177,7 @@ void TryAlternativeSignalMethod(string signalData)
       Print("🚨 Emergency fallback to Global Variables...");
       string magicStr = IntegerToString(HedgeEA_Magic);
       GlobalVariableSet("EASignal_Emergency_" + magicStr, (double)TimeCurrent());
-      GlobalVariableSet("EASignal_Data_" + magicStr, (double)StringGetTickCount(signalData));
+      GlobalVariableSet("EASignal_Data_" + magicStr, (double)StringHash(signalData));
       Print("Emergency signal sent via Global Variables");
    }
 }
@@ -2410,8 +2396,8 @@ void SendHedgeSignal(string signalType, string direction, double volume, double 
    {
       // Original global variable code
       string magicStr = IntegerToString(HedgeEA_Magic);
-      GlobalVariableSet("EASignal_Type_" + magicStr, (double)StringGetTickCount(signalType));
-      GlobalVariableSet("EASignal_Direction_" + magicStr, (double)StringGetTickCount(direction));
+      GlobalVariableSet("EASignal_Type_" + magicStr, (double)StringHash(signalType));
+      GlobalVariableSet("EASignal_Direction_" + magicStr, (double)StringHash(direction));
       GlobalVariableSet("EASignal_Volume_" + magicStr, volume);
       GlobalVariableSet("EASignal_SL_" + magicStr, adjustedSL);
       GlobalVariableSet("EASignal_TP_" + magicStr, adjustedTP);
